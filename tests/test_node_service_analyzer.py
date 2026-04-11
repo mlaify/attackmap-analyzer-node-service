@@ -1,8 +1,16 @@
 from pathlib import Path
 
+from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
+from attackmap.sdk.models import ScanResult as SharedScanResult
+from attackmap_analyzer_node_service.contracts import AnalyzerMetadata, ScanResult
 from attackmap_analyzer_node_service import NodeServiceAnalyzer
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_contracts_use_shared_sdk_types() -> None:
+    assert AnalyzerMetadata is SharedAnalyzerMetadata
+    assert ScanResult is SharedScanResult
 
 
 def test_metadata_contains_required_fields() -> None:
