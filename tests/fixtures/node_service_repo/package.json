@@ -1,0 +1,15 @@
+{
+  "name": "@attackmap/node-service-demo",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "packages/*"
+  ],
+  "dependencies": {
+    "express": "^4.19.0",
+    "axios": "^1.7.0",
+    "pg": "^8.11.0",
+    "ioredis": "^5.4.0",
+    "jsonwebtoken": "^9.0.0"
+  }
+}
