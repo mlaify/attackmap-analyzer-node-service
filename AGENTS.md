@@ -4,7 +4,7 @@
 This repository contains an AttackMap analyzer.
 
 AttackMap analyzers live under:
-- `matthewd.xyzAI/attackmap-analyzers`
+- `github.com/mlaify`
 
 This repo should implement one analyzer cleanly against the AttackMap core contract.
 

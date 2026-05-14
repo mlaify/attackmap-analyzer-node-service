@@ -15,7 +15,7 @@ This analyzer is intentionally heuristic and incremental. It is not Bluesky-spec
 ## Install
 
 ```bash
-pip install git+https://gitlab.com/matthewd.xyzAI/attackmap-analyzers/attackmap-analyzer-node-service.git
+pip install git+https://github.com/mlaify/attackmap-analyzer-node-service.git
 ```
 
 ## Usage
