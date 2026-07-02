@@ -1,0 +1,5 @@
+{
+  "name": "@attackmap/async-workers",
+  "private": true,
+  "dependencies": { "bullmq": "^5.0.0", "kafkajs": "^2.2.0" }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "@attackmap/xrpc-demo",
+  "private": true,
+  "dependencies": { "@atproto/xrpc-server": "^0.6.0" }
+}

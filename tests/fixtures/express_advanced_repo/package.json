@@ -1,0 +1,5 @@
+{
+  "name": "@attackmap/express-advanced",
+  "private": true,
+  "dependencies": { "express": "^4.19.0" }
+}

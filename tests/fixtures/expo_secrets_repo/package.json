@@ -1,0 +1,5 @@
+{
+  "name": "@attackmap/expo-secrets",
+  "private": true,
+  "dependencies": { "expo": "~50.0.0" }
+}
