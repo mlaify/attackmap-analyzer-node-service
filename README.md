@@ -1,5 +1,10 @@
 # AttackMap Node Service Analyzer
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 `attackmap-analyzer-node-service` is a broad Node.js/TypeScript backend analyzer module for AttackMap.
 
 It is designed for distributed service repositories and emits structured scan signals for:
