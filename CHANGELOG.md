@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — route-level auth (#9, AttackMap#256; part of #4)
+
+- **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the middleware / guard and `guard_evidence` quoting the registration that attached it. AttackMap ≥ 0.6 trusts this over its own same-file resolution and its ±40-line auth-hint window. Older cores ignore the fields, and the file-level `nestjs_guard` / `passport_authenticate` hints are kept for one release.
+- **Express / Koa / Hono / Fastify:** route-local middleware (arrays flattened, `router.route('/x').post(mw, h)`, Fastify `preHandler` / `onRequest` / `preValidation` route options), plus `use([path,] mw)`, `all('*', mw)` and Fastify `addHook(...)` registered *before* the route on its router. Routers are followed through `use([path,] mw..., router)` / `use(router.routes())` / `route(path, sub)` mounts, including routers imported from another file via `require` / default `import` and `module.exports` / `export default`. Fastify `register()` plugins inherit their parent's hooks.
+- **Explicit opt-outs:** express-unless `guard.unless({ path: [...] })` with literal paths makes the listed routes `anonymous` when no other guard applies. NestJS `@Public()` / `@SkipAuth()` / `@AllowAnonymous()` / `@SetMetadata('isPublic', true)` do the same, unless the guard is Passport's `AuthGuard('...')`, which doesn't read that metadata.
+- **NestJS:** `@UseGuards(...)` on the method or controller, and global `useGlobalGuards(...)` / `{ provide: APP_GUARD, useClass }` anywhere in the repo, make routes `required`.
+- Cross-file mount *prefixes*, `fastify.route({...})` and Hono/Elysia `route()` / `group()` prefixes (the rest of #4) are not part of this change: mounted routes keep their file-local paths.
+- Brackets are matched in one cached pass per file, arguments are split by jumping over nested functions, and binding lookups, `use()` lists, mount depth and mount paths are bounded, so adversarial input stays linear.
+
 ### Fixed — false-positive routes and noisy hints (#3)
 
 - **Routes need a router receiver and a rooted path.** `<var>.<verb>('...')` used to become a route for any receiver and any string, so `req.get('Authorization')`, `cache.get('session')`, `searchParams.get('page')`, `store.post('/x')` and outbound `axios.get('/internal/health')` all showed up as inbound routes (with a `/` prepended). A match now counts only when the receiver is a router: a name assigned from `express()` / `express.Router()` / `Router()` / `new Router()` / `new Hono()` / `new Koa()` / `new Elysia()` / `fastify()` / `polka()`, a parameter typed `Router` / `Express` / `Application` / `FastifyInstance` / `Hono` / `Elysia`, either side of an `x.use('/prefix', y)` mount, or one of the conventional names `app`, `router`, `server`, `fastify` (untyped `module.exports = (app) => …`). The path literal must start with `/` or be `*`. Verbs are matched case-sensitively. Chained `x.route('/p').get()…` uses the same check.

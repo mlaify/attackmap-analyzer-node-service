@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snippet, read_source, rel
 
+from . import route_auth as ra
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -295,6 +296,11 @@ class NodeServiceAnalyzer:
         # Workspaces contribute service topology hints (one per workspace
         # package). Done once, up front, then per-file walk fills in the rest.
         self._emit_workspace_service_hints(root, result)
+        # Route auth (AttackMap#256) is resolved after the walk: routers are
+        # mounted, and NestJS global guards declared, in other files.
+        self._auth_registry = ra.Registry()
+        self._auth_pending: list[tuple[int, object]] = []
+        self._nest_global_guards: list[tuple[str, bool, str]] = []
 
         for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             result.files_scanned += 1
@@ -324,6 +330,11 @@ class NodeServiceAnalyzer:
 
             self._extract_routes(content, relative, result)
             self._extract_nestjs_routes(content, relative, result)
+            if "useGlobalGuards" in content or "APP_GUARD" in content:
+                self._nest_global_guards += ra.nest_global_guards(content)
+            if ".use(" in content or ".route(" in content or ".register(" in content:
+                # A file that only mounts routers (app.js) still guards them.
+                self._file_routers(content, relative, [])
             self._extract_trpc_procedures(content, relative, result)
             self._extract_xrpc_handlers(content, relative, result)
             self._extract_nextjs_file_routes(file_path, root, content, result)
@@ -334,14 +345,53 @@ class NodeServiceAnalyzer:
             self._extract_auth_hints(content, relative, result)
             self._extract_secret_hints(content, relative, result)
 
+        self._auth_registry.finalize()
+        for index, resolve in self._auth_pending:
+            self._set_route_auth(result, index, resolve())  # type: ignore[operator]
+        self._auth_pending = []
+
         result.languages.sort()
         return result
+
+    def _defer_auth(self, index: int | None, resolve) -> None:  # type: ignore[no-untyped-def]
+        pending = getattr(self, "_auth_pending", None)
+        if index is not None and pending is not None:
+            pending.append((index, resolve))
+
+    def _file_routers(self, content: str, relative: str, cache: list) -> ra.FileRouters:
+        if not cache:
+            registry = getattr(self, "_auth_registry", None)
+            existing = registry.files.get(relative) if registry is not None else None
+            cache.append(existing or ra.FileRouters(content, relative))
+            if registry is not None and existing is None:
+                registry.add(cache[0])
+        return cache[0]
+
+    @staticmethod
+    def _local_guards(content: str, paren: int, first: int, start: int) -> list[ra.Guard]:
+        """Auth middleware among a registration's arguments from ``first`` up
+        to (not including) the handler; Fastify route options count too."""
+        close = ra.matching_close(content, paren)
+        if close < 0:
+            return []
+        context = content[start : min(close + 1, start + 400)]
+        args = ra.split_args(content, paren, close)[first:-1]
+        guards: list[ra.Guard] = []
+        for s, e in args:
+            guards += ra.route_option_guards(content, s, e, context)
+        for s, e in ra.flatten(content, args):
+            guard = ra.guard_from_arg(content, s, e, context)
+            if guard is not None:
+                guards.append(guard)
+        return guards
 
     # ---- Route extractors ----
 
     def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
         prefixes = self._collect_express_prefixes(content)
         routers = self._router_names(content, prefixes)
+        file_routers: list[ra.FileRouters] = []
+        registry = getattr(self, "_auth_registry", None)
 
         for match in EXPRESS_ROUTE_PATTERN.finditer(content):
             owner, method, path = match.group(1), match.group(2).upper(), match.group(3)
@@ -351,7 +401,16 @@ class NodeServiceAnalyzer:
             full_path = self._join_route(prefix, path)
             # Express `.all()` matches every verb: core's sentinel is ANY.
             method = "ANY" if method == "ALL" else method
-            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
+            index = self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
+            if index is not None and registry is not None:
+                fr = self._file_routers(content, relative, file_routers)
+                local = self._local_guards(content, content.find("(", match.start() + len(owner)), 1, match.start())
+                self._defer_auth(
+                    index,
+                    lambda fr=fr, owner=owner, at=match.start(), path=path, local=local: registry.resolve_route(
+                        fr, owner, at, path, local
+                    ),
+                )
 
         # `router.route('/x').get(...).post(...)`
         for match in EXPRESS_ROUTE_OPENER_PATTERN.finditer(content):
@@ -370,7 +429,19 @@ class NodeServiceAnalyzer:
             for verb_match in CHAIN_VERB_PATTERN.finditer(window):
                 verb_line = line_of(content, match.end() + verb_match.start())
                 verb = verb_match.group(1).upper()
-                self._append_unique_route(result, full_path, "ANY" if verb == "ALL" else verb, relative, verb_line)
+                index = self._append_unique_route(
+                    result, full_path, "ANY" if verb == "ALL" else verb, relative, verb_line
+                )
+                if index is not None and registry is not None:
+                    fr = self._file_routers(content, relative, file_routers)
+                    paren = match.end() + verb_match.end() - 1
+                    local = self._local_guards(content, paren, 0, match.start())
+                    self._defer_auth(
+                        index,
+                        lambda fr=fr, owner=owner, at=match.start(), path=path, local=local: registry.resolve_route(
+                            fr, owner, at, path, local
+                        ),
+                    )
 
     @staticmethod
     def _router_names(content: str, prefixes: dict[str, str]) -> set[str]:
@@ -449,11 +520,19 @@ class NodeServiceAnalyzer:
             if not NESTJS_METHOD_PATTERN.search(content):
                 return
             prefix = ""
+        nest: list[ra.NestFile] = []
         for match in NESTJS_METHOD_PATTERN.finditer(content):
             verb, sub_path = match.group(1).upper(), (match.group(2) or "")
             full_path = self._join_route(prefix, sub_path)
             method = "ANY" if verb == "ALL" else verb
-            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
+            index = self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
+            if index is not None:
+                if not nest:
+                    nest.append(ra.NestFile(content))
+                self._defer_auth(
+                    index,
+                    lambda nest_file=nest[0], at=match.start(): nest_file.resolve(at, self._nest_global_guards),
+                )
 
     def _extract_trpc_procedures(self, content: str, relative: str, result: ScanResult) -> None:
         for match in TRPC_PROCEDURE_PATTERN.finditer(content):
@@ -782,11 +861,43 @@ class NodeServiceAnalyzer:
         return next(iter_repo_files(root, names={name}, skip_dirs=SKIP_DIRS), None) is not None
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int,
+        *,
+        auth: str = ra.UNKNOWN,
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> int | None:
+        """Append a route once per (path, method, file); return its index, or
+        None when it was already recorded."""
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
+            return None
+        result.routes.append(
+            Route(
+                path=path, method=method, file=file, line=line,
+                auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
+            )
+        )
+        return len(result.routes) - 1
+
+    @staticmethod
+    def _set_route_auth(result: ScanResult, index: int, resolution: ra.Resolution) -> None:
+        """Declare a route's auth (AttackMap#256); older cores ignore the fields,
+        and the file-level `nestjs_guard` / `passport_authenticate` hints stay
+        for one release. Rebuilt rather than mutated so Route's guard_evidence
+        redaction runs."""
+        if resolution.auth == ra.UNKNOWN:
             return
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+        route = result.routes[index]
+        result.routes[index] = Route(
+            path=route.path, method=route.method, file=route.file, line=route.line,
+            auth=resolution.auth, guards=list(resolution.guards), guard_evidence=resolution.evidence,
+        )
 
     @staticmethod
     def _append_unique_external(

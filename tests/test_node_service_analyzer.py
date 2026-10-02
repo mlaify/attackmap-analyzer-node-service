@@ -440,3 +440,103 @@ def test_pg_word_alone_is_not_a_postgres_hint(tmp_path: Path) -> None:
 
 def _analyze_path(path: Path):
     return NodeServiceAnalyzer().analyze(path)
+
+
+# ---------- Route.auth contract (AttackMap#256) ----------
+
+
+def _route_auth(path: Path) -> dict:
+    return {f"{r.file} {r.method} {r.path}": r for r in NodeServiceAnalyzer().analyze(path).routes}
+
+
+def test_express_guards_from_use_route_args_and_cross_file_mounts() -> None:
+    routes = _route_auth(FIXTURES / "route_auth_repo")
+    settings = routes["src/app.js PUT /settings"]
+    assert settings.auth == "required"
+    assert settings.guards == ["expressjwt"]
+    assert settings.guard_evidence.startswith("app.use( expressjwt(")
+    # routes/users.js is mounted from app.js after the app-level JWT guard...
+    create = routes["src/routes/users.js POST /"]
+    assert create.auth == "required"
+    assert create.guards == ["expressjwt"]
+    # ...and route-local middleware adds to it.
+    delete = routes["src/routes/users.js DELETE /:id"]
+    assert delete.guards == ["requireAdmin", "expressjwt"]
+    assert delete.guard_evidence.startswith("router.delete('/:id', requireAdmin, deleteUser)")
+    # Registered before the guard: Express runs middleware in order.
+    assert routes["src/app.js POST /contact"].auth == "unknown"
+
+
+def test_express_unless_paths_are_explicitly_public() -> None:
+    routes = _route_auth(FIXTURES / "route_auth_repo")
+    login = routes["src/app.js POST /login"]
+    assert login.auth == "anonymous"
+    assert login.guards == []
+    assert login.guard_evidence == "unless({ path: ['/login', '/signup'] })"
+    assert routes["src/app.js POST /signup"].auth == "anonymous"
+
+
+def test_fastify_route_options_and_register_hooks() -> None:
+    routes = _route_auth(FIXTURES / "route_auth_repo")
+    orders = routes["src/server.js POST /orders"]
+    assert orders.auth == "required"
+    assert orders.guards == ["app.authenticate"]
+    # addHook inside a register() plugin guards that plugin's routes only.
+    payments = routes["src/server.js POST /payments"]
+    assert payments.auth == "required"
+    assert payments.guards == ["jwtVerify"]
+    assert routes["src/server.js POST /webhooks"].auth == "unknown"
+
+
+def test_nestjs_use_guards_and_public_opt_out() -> None:
+    routes = _route_auth(FIXTURES / "route_auth_repo")
+    create = routes["src/nest/posts.controller.ts POST /posts"]
+    assert create.auth == "required"
+    assert create.guards == ["JwtAuthGuard"]
+    assert create.guard_evidence == "@UseGuards(JwtAuthGuard)"
+    # @Public() on the method opts out of the controller's guard.
+    preview = routes["src/nest/posts.controller.ts POST /posts/preview"]
+    assert preview.auth == "anonymous"
+    assert preview.guard_evidence == "@Public()"
+    # Passport's AuthGuard('jwt') ignores @Public() metadata.
+    card = routes["src/nest/billing.controller.ts DELETE /billing/cards"]
+    assert card.auth == "required"
+    assert card.guards == ["AuthGuard('jwt')"]
+    assert routes["src/nest/billing.controller.ts POST /billing/quote"].auth == "unknown"
+
+
+def test_nestjs_global_guard_and_unknowable_express_cases(tmp_path: Path) -> None:
+    (tmp_path / "app.module.ts").write_text(
+        "@Module({\n  providers: [{ provide: APP_GUARD, useClass: JwtAuthGuard }],\n})\nexport class AppModule {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "feed.controller.ts").write_text(
+        "@Controller('feed')\nexport class FeedController {\n"
+        "  @Post()\n  publish() {}\n\n"
+        "  @Public()\n  @Post('ping')\n  ping() {}\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.use(optionalAuth);\n"
+        "app.post('/comments', addComment);\n"
+        "app.use(jwt({ secret }).unless({ path: [/^\\/public/] }));\n"
+        "app.post('/public/upload', upload);\n"
+        "module.exports = (router) => {\n"
+        "  router.post('/notes', requireAuth, addNote);\n"
+        "  router.post('/drafts', addDraft);\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    routes = {f"{r.method} {r.path}": r for r in NodeServiceAnalyzer().analyze(tmp_path).routes}
+    assert routes["POST /feed"].auth == "required"
+    assert routes["POST /feed"].guards == ["JwtAuthGuard"]
+    assert routes["POST /feed/ping"].auth == "anonymous"
+    # optionalAuth admits anonymous callers; it isn't a guard.
+    assert routes["POST /comments"].auth == "unknown"
+    # A regex in the unless list could match anything.
+    assert routes["POST /public/upload"].auth == "unknown"
+    # A router passed in from elsewhere: local middleware still counts.
+    assert routes["POST /notes"].auth == "required"
+    assert routes["POST /drafts"].auth == "unknown"
