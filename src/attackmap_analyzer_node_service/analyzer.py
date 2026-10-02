@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
+
 from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, Route, ScanResult, SecretHint
 
 CODE_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".tsx"}
-SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".next", ".turbo", ".svelte-kit", "out"}
+# Pruned by repo-relative directory name (attackmap.sdk.fs, AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {".svelte-kit"}
 
 # ---- Route extraction ---------------------------------------------------------
 
@@ -193,8 +197,8 @@ class NodeServiceAnalyzer:
         if not root.exists() or not root.is_dir():
             return False
 
-        has_package = (root / "package.json").exists() or any(root.glob("**/package.json"))
-        has_typescript = (root / "tsconfig.json").exists() or any(root.glob("**/tsconfig.json"))
+        has_package = (root / "package.json").exists() or self._has_file(root, "package.json")
+        has_typescript = (root / "tsconfig.json").exists() or self._has_file(root, "tsconfig.json")
         has_service_dirs = (root / "services").is_dir() or (root / "packages").is_dir() or (root / "apps").is_dir()
         has_pnpm_workspace = (root / "pnpm-workspace.yaml").exists()
         has_nx_or_turbo = (root / "nx.json").exists() or (root / "turbo.json").exists()
@@ -202,12 +206,8 @@ class NodeServiceAnalyzer:
         if has_package and (has_typescript or has_service_dirs or has_pnpm_workspace or has_nx_or_turbo):
             return True
 
-        for file_path in root.rglob("*"):
-            if not file_path.is_file() or file_path.suffix not in CODE_SUFFIXES:
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-            content = self._read_text(file_path)
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            content = read_source(file_path)
             if not content:
                 continue
             if re.search(
@@ -223,28 +223,23 @@ class NodeServiceAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        root_package_name = self._package_name_from(root / "package.json")
+        root_package_name = self._package_name_from(root / "package.json", root)
 
         # Workspaces contribute service topology hints (one per workspace
         # package). Done once, up front, then per-file walk fills in the rest.
         self._emit_workspace_service_hints(root, result)
 
-        for file_path in root.rglob("*"):
-            if not file_path.is_file() or file_path.suffix not in CODE_SUFFIXES:
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             result.files_scanned += 1
-            language = "typescript" if file_path.suffix in {".ts", ".tsx"} else "javascript"
+            language = "typescript" if file_path.suffix.lower() in {".ts", ".tsx"} else "javascript"
             if language not in result.languages:
                 result.languages.append(language)
 
-            content = self._read_text(file_path)
+            content = read_source(file_path)
             if content is None:
                 continue
 
-            relative = str(file_path.relative_to(root)).replace("\\", "/")
+            relative = rel(file_path, root)
             service_name = self._infer_service_name(relative, root_package_name)
             service_role = self._infer_service_role(service_name, relative)
 
@@ -382,7 +377,7 @@ class NodeServiceAnalyzer:
     def _extract_nextjs_file_routes(
         self, file_path: Path, root: Path, content: str, result: ScanResult
     ) -> None:
-        relative = str(file_path.relative_to(root)).replace("\\", "/")
+        relative = rel(file_path, root)
         parts = relative.split("/")
 
         # App Router: `app/**/route.ts` where each HTTP verb is a named export.
@@ -488,47 +483,75 @@ class NodeServiceAnalyzer:
         live outside `services/*` / `packages/*`.
         """
         seen: set[str] = set()
-        root_pkg = root / "package.json"
-        if root_pkg.exists():
-            try:
-                data = json.loads(root_pkg.read_text(encoding="utf-8"))
-                patterns = data.get("workspaces")
-                if isinstance(patterns, dict):
-                    patterns = patterns.get("packages", [])
-                if isinstance(patterns, list):
-                    for pattern in patterns:
-                        for pkg_json in root.glob(f"{pattern}/package.json"):
-                            self._record_workspace_service(pkg_json, root, seen, result)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                pass
+        # One pruned walk for every nested package.json; workspace globs are
+        # matched against these repo-relative paths instead of `root.glob()`,
+        # which descended node_modules and followed symlinks out of the repo.
+        package_jsons: list[str] | None = None
 
-        pnpm = root / "pnpm-workspace.yaml"
-        if pnpm.exists():
+        def matching(pattern: str) -> list[Path]:
+            nonlocal package_jsons
+            if package_jsons is None:
+                package_jsons = [
+                    rel(path, root) for path in iter_repo_files(root, names={"package.json"}, skip_dirs=SKIP_DIRS)
+                ]
+            wanted = [seg for seg in pattern.strip().strip("/").split("/") if seg not in {"", "."}]
+            return [
+                root / relative
+                for relative in package_jsons
+                if self._workspace_glob_match(wanted, relative.split("/")[:-1])
+            ]
+
+        root_pkg_text = read_source(root / "package.json", root=root)
+        if root_pkg_text is not None:
             try:
-                # Lightweight yaml: pull quoted `packages:` list entries
-                text = pnpm.read_text(encoding="utf-8")
-                for pattern_match in re.finditer(r"-\s*['\"]?([^'\"\n]+)['\"]?", text):
-                    pattern = pattern_match.group(1).strip()
-                    if not pattern or pattern.startswith("#"):
+                data = json.loads(root_pkg_text)
+            except json.JSONDecodeError:
+                data = None
+            patterns = data.get("workspaces") if isinstance(data, dict) else None
+            if isinstance(patterns, dict):
+                patterns = patterns.get("packages", [])
+            if isinstance(patterns, list):
+                for pattern in patterns:
+                    if not isinstance(pattern, str):
                         continue
-                    for pkg_json in root.glob(f"{pattern}/package.json"):
+                    for pkg_json in matching(pattern):
                         self._record_workspace_service(pkg_json, root, seen, result)
-            except UnicodeDecodeError:
-                pass
+
+        text = read_source(root / "pnpm-workspace.yaml", root=root)
+        if text is not None:
+            # Lightweight yaml: pull quoted `packages:` list entries
+            for pattern_match in re.finditer(r"-\s*['\"]?([^'\"\n]+)['\"]?", text):
+                pattern = pattern_match.group(1).strip()
+                if not pattern or pattern.startswith("#"):
+                    continue
+                for pkg_json in matching(pattern):
+                    self._record_workspace_service(pkg_json, root, seen, result)
+
+    @staticmethod
+    def _workspace_glob_match(pattern: list[str], parts: list[str]) -> bool:
+        """Match a workspace glob (``packages/*``, ``apps/**``) against dir parts."""
+        if not pattern:
+            return not parts
+        head, rest = pattern[0], pattern[1:]
+        if head == "**":
+            return any(
+                NodeServiceAnalyzer._workspace_glob_match(rest, parts[i:]) for i in range(len(parts) + 1)
+            )
+        return bool(parts) and fnmatch.fnmatchcase(parts[0], head) and NodeServiceAnalyzer._workspace_glob_match(
+            rest, parts[1:]
+        )
 
     def _record_workspace_service(
         self, pkg_json: Path, root: Path, seen: set[str], result: ScanResult
     ) -> None:
-        if any(part in SKIP_DIRS for part in pkg_json.parts):
-            return
-        pkg_name = self._package_name_from(pkg_json)
+        pkg_name = self._package_name_from(pkg_json, root)
         if not pkg_name:
             return
         short = pkg_name.split("/")[-1].lower()
         if short in seen:
             return
         seen.add(short)
-        relative = str(pkg_json.relative_to(root)).replace("\\", "/")
+        relative = rel(pkg_json, root)
         self._append_unique_auth(result, f"service_name:{short}", relative)
         self._append_unique_auth(result, f"workspace_package:{pkg_name}", relative)
 
@@ -575,12 +598,15 @@ class NodeServiceAnalyzer:
         return token.lower().replace("_", "-")
 
     @staticmethod
-    def _package_name_from(path: Path) -> str | None:
-        if not path.exists():
+    def _package_name_from(path: Path, root: Path) -> str | None:
+        text = read_source(path, root=root)
+        if text is None:
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
             return None
         name = data.get("name")
         if isinstance(name, str) and name.strip():
@@ -588,11 +614,9 @@ class NodeServiceAnalyzer:
         return None
 
     @staticmethod
-    def _read_text(path: Path) -> str | None:
-        try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return None
+    def _has_file(root: Path, name: str) -> bool:
+        # Stops at the first match; never enters node_modules et al.
+        return next(iter_repo_files(root, names={name}, skip_dirs=SKIP_DIRS), None) is not None
 
     @staticmethod
     def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:

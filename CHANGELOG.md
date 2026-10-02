@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — AttackMap#253
+
+- **Repo walking now uses `attackmap.sdk.fs`.** `detect()` and `analyze()` walk with `iter_repo_files` and read with `read_source`. Skip dirs are matched by repo-relative name and pruned, so a repo checked out under a `build/`, `dist/` or `out/` directory is analyzed instead of yielding nothing, and `node_modules` is never descended.
+- **`detect()` no longer walks `node_modules`.** The `**/package.json` / `**/tsconfig.json` probes used unpruned `root.glob()`; they now use the pruned walker and stop at the first match.
+- **Workspace globs** (`workspaces`, `pnpm-workspace.yaml`) are matched against the pruned walk instead of `root.glob()`, so they can't follow symlinks out of the repo or pick up `node_modules` packages.
+- **Symlinked files pointing outside the repo are not analyzed**, unreadable files no longer raise out of `analyze()`, and cp1252/latin-1 sources are decoded instead of dropped. AttackMap's own report directories are skipped.
+
+### Changed
+
+- Skip list is now the SDK's `DEFAULT_SKIP_DIRS` plus `.svelte-kit` (adds `vendor`, `target`, `venv`, `.venv`, `.tox`, `bower_components` and caches).
+- Files are visited in sorted, depth-first order, so signal order is deterministic across filesystems. The set of signals is unchanged.
+- Requires an AttackMap core that ships `attackmap.sdk.fs`.
+
 ## [0.2.0] - 2026-06-25
 
 ### Added — closes AttackMap#17
