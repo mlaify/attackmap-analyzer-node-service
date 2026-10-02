@@ -375,3 +375,68 @@ def test_signals_cite_the_line_they_were_found_on() -> None:
     for hint in [*result.auth_hints, *result.edge_hints, *result.entrypoint_hints]:
         source = (root / hint.file).read_text().split("\n")
         assert hint.evidence_text == source[hint.line - 1].strip()
+
+
+# ---------------------------------------------------------------------------
+# False-positive routes / noisy hints (#3)
+# ---------------------------------------------------------------------------
+
+
+def test_non_router_get_and_post_calls_are_not_routes() -> None:
+    # req.get, cache.get, URLSearchParams.get, axios.get('/x') and a
+    # non-router `.post('/x')` are all `<var>.<verb>('...')` calls.
+    result = _analyze("route_false_positive_repo")
+    keys = {(r.path, r.method) for r in result.routes}
+    assert keys == {("/api/users/:id", "GET")}
+
+
+def test_client_calls_with_a_path_become_external_calls_with_a_method() -> None:
+    result = _analyze("route_false_positive_repo")
+    calls = {(c.target, c.method) for c in result.external_calls}
+    assert ("/internal/health", "GET") in calls  # axios.get
+    assert ("https://audit.internal.example/events", "POST") in calls  # got.post
+    # axios.create() instance; the template-literal tail is the dynamic segment.
+    assert ("/invoices/", "PUT") in calls
+    assert "edge:orders-api->audit" in {h.hint for h in result.edge_hints}
+
+
+def test_absolute_url_axios_calls_keep_their_method() -> None:
+    result = _analyze("node_service_repo")
+    calls = {(c.target, c.method) for c in result.external_calls}
+    assert ("https://worker.internal.local/rebuild", "POST") in calls
+
+
+def test_bare_verify_and_sign_calls_are_not_auth_hints() -> None:
+    result = _analyze("route_false_positive_repo")
+    hints = {h.hint for h in result.auth_hints}
+    assert "signature_verify" not in hints
+    assert "signature_sign" not in hints
+
+
+def test_jwt_verify_is_an_auth_hint() -> None:
+    result = _analyze("router_param_repo")
+    assert "signature_verify" in {h.hint for h in result.auth_hints}
+
+
+def test_routes_on_typed_router_params_and_conventional_app_are_kept() -> None:
+    result = _analyze("router_param_repo")
+    keys = {(r.path, r.method) for r in result.routes}
+    assert ("/users", "GET") in keys  # (users: Router)
+    assert ("/users/:id", "DELETE") in keys
+    assert ("/legacy/import", "POST") in keys  # untyped `(app) =>`
+    assert ("/*", "ANY") in keys  # `.all("*")`: ALL normalized to core's ANY
+
+
+def test_pg_word_alone_is_not_a_postgres_hint(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"name": "x"}')
+    (tmp_path / "tsconfig.json").write_text("{}")
+    (tmp_path / "ui.ts").write_text(
+        "// pg 3 of the wizard\nconst pg = pages[0];\nexport const cls = 'pg-header';\n"
+    )
+    assert _analyze_path(tmp_path).databases == []
+    (tmp_path / "db.ts").write_text("const { Client } = require('pg');\n")
+    assert {d.kind for d in _analyze_path(tmp_path).databases} == {"postgresql"}
+
+
+def _analyze_path(path: Path):
+    return NodeServiceAnalyzer().analyze(path)

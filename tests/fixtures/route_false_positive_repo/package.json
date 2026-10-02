@@ -1,0 +1,5 @@
+{
+  "name": "orders-api",
+  "version": "1.0.0",
+  "dependencies": { "express": "^4.19.0", "axios": "^1.7.0", "got": "^14.0.0" }
+}

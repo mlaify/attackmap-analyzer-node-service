@@ -28,17 +28,48 @@ SKIP_DIRS = DEFAULT_SKIP_DIRS | {".svelte-kit"}
 
 # ---- Route extraction ---------------------------------------------------------
 
-# Express / Hono / Koa / Elysia share this shape: `<var>.<verb>('/path', ...)`.
-# They're structurally indistinguishable at the regex level; framework
-# discrimination happens via ENTRYPOINT_PATTERNS below.
+# Express / Hono / Koa / Elysia / Fastify share this shape:
+# `<var>.<verb>('/path', ...)`. So does every `map.get('k')`,
+# `req.get('Authorization')` and HTTP-client call (`axios.get('/x')`), so a
+# match only becomes a route when the receiver is a known router (see
+# ROUTER_ASSIGN_PATTERN / ROUTER_PARAM_PATTERN / CONVENTIONAL_ROUTER_NAMES) and
+# the path literal is rooted (`/...`) or the `*` wildcard. Verbs are lower-case
+# in every framework, so the match is case-sensitive.
 EXPRESS_ROUTE_PATTERN = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*)\.(get|post|put|patch|delete|options|head|all)\(\s*['\"]([^'\"]+)['\"]",
-    re.IGNORECASE,
+    r"\b([A-Za-z_$][A-Za-z0-9_$]*)\.(get|post|put|patch|delete|options|head|all)\(\s*['\"`]([^'\"`]+)['\"`]",
 )
-FASTIFY_ROUTE_PATTERN = re.compile(
-    r"\bfastify\.(get|post|put|patch|delete|options|head)\(\s*['\"]([^'\"]+)['\"]",
-    re.IGNORECASE,
+
+# Names that hold a router/app: `const app = express()`, `express.Router()`,
+# `Router()`, `new Router()`, `new Hono()`, `new Koa()`, `new Elysia()`,
+# `fastify(...)`, `Fastify(...)`, `polka()`.
+ROUTER_ASSIGN_PATTERN = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*[^=;\n]+)?=\s*(?:await\s+)?"
+    r"(?:express(?:\.Router)?\s*\(|Router\s*\(|fastify\s*\(|Fastify\s*\(|polka\s*\(|"
+    r"new\s+(?:Hono|OpenAPIHono|Koa|Router|KoaRouter|Elysia)\b)",
 )
+# Function parameters typed as a router/app: `(router: Router)`,
+# `(app: express.Express)`, `(fastify: FastifyInstance)`, `(app: Hono)`.
+ROUTER_PARAM_PATTERN = re.compile(
+    r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\??\s*:\s*(?:express\.)?"
+    r"(?:Router|IRouter|Express|Application|FastifyInstance|Hono|Elysia|KoaRouter)\b",
+)
+# Untyped JS routinely receives the app as a bare parameter
+# (`module.exports = (app) => { app.get('/x', ...) }`); these conventional
+# names are trusted as routers without a visible assignment.
+CONVENTIONAL_ROUTER_NAMES = frozenset({"app", "router", "server", "fastify"})
+
+# HTTP-client receivers. `<client>.<verb>('/path' | 'https://...')` is an
+# *outbound* call, recorded as an ExternalCall with its method, never a route.
+# Instances made with `axios.create(...)` / `got.extend(...)` / `ky.create(...)`
+# are tracked too (CLIENT_ASSIGN_PATTERN).
+KNOWN_CLIENT_NAMES = frozenset(
+    {"axios", "got", "ky", "api", "http", "https", "client", "fetcher", "superagent", "request", "httpClient", "apiClient"}
+)
+CLIENT_ASSIGN_PATTERN = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*[^=;\n]+)?=\s*"
+    r"(?:axios\.create|got\.extend|ky\.(?:create|extend))\s*\(",
+)
+CLIENT_VERBS = frozenset({"get", "post", "put", "patch", "delete", "options", "head"})
 
 # `app.use('/prefix', router)` — subsequent routes on `router` inherit the prefix
 # in the same file. Captures (owner_var, prefix, mounted_var).
@@ -137,8 +168,9 @@ KAFKA_TOPIC_PATTERN = re.compile(
 
 OUTBOUND_PATTERNS = [
     re.compile(r"\bfetch\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
-    re.compile(r"\baxios\.(?:get|post|put|patch|delete)\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
-    re.compile(r"\bgot(?:\.(?:get|post|put|patch|delete))?\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
+    # `axios.get(url)` / `got.post(url)` carry a method; they're handled by
+    # the client-receiver branch of _extract_routes instead.
+    re.compile(r"\bgot\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
     re.compile(r"\bundici\.(?:request|fetch)\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
     re.compile(r"\bofetch\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
 ]
@@ -149,7 +181,16 @@ ENV_URL_PATTERN = re.compile(r"process\.env\.([A-Z0-9_]+_URL)\b")
 DB_PATTERNS = [
     (re.compile(r"\bnew\s+PrismaClient\s*\(", re.IGNORECASE), "sql"),
     (re.compile(r"\bPool\s*\(\s*\{", re.IGNORECASE), "postgresql"),
-    (re.compile(r"\bpg\b|\bnode-postgres\b", re.IGNORECASE), "postgresql"),
+    # The `pg` driver by import/require only; a bare `pg` word matched
+    # comments, class names (`pg-header`) and loop variables.
+    (
+        re.compile(
+            r"\bfrom\s+['\"](?:pg|pg-pool|pg-promise|postgres)['\"]"
+            r"|\brequire\(\s*['\"](?:pg|pg-pool|pg-promise|postgres)['\"]\s*\)"
+            r"|\bnode-postgres\b"
+        ),
+        "postgresql",
+    ),
     (re.compile(r"\bknex\s*\(", re.IGNORECASE), "sql"),
     (re.compile(r"\bdrizzle\s*\(", re.IGNORECASE), "sql"),
     (re.compile(r"\bmongoose\.connect\s*\(", re.IGNORECASE), "mongodb"),
@@ -166,8 +207,22 @@ AUTH_PATTERNS = [
     (re.compile(r"\bAuthorization\b"), "authorization_header"),
     (re.compile(r"\bBearer\b"), "bearer_token"),
     (re.compile(r"\bjwt\b|\bjsonwebtoken\b", re.IGNORECASE), "jwt"),
-    (re.compile(r"\bverify\s*\(", re.IGNORECASE), "signature_verify"),
-    (re.compile(r"\bsign\s*\(", re.IGNORECASE), "signature_sign"),
+    # Crypto/JWT verify and sign only: a bare `verify(` / `sign(` matched
+    # test helpers, form validators and nearly every JS repo.
+    (
+        re.compile(
+            r"\b(?:jwt|JWT|jsonwebtoken|jose|crypto(?:\.subtle)?)\.verify\s*\("
+            r"|\bjwtVerify\s*\(|\bcrypto\.createVerify\s*\("
+        ),
+        "signature_verify",
+    ),
+    (
+        re.compile(
+            r"\b(?:jwt|JWT|jsonwebtoken|jose|crypto(?:\.subtle)?)\.sign\s*\("
+            r"|\bnew\s+SignJWT\s*\(|\bcrypto\.createSign\s*\("
+        ),
+        "signature_sign",
+    ),
     (re.compile(r"\boauth\b|\boidc\b", re.IGNORECASE), "oauth"),
     (re.compile(r"\bDPoP\b|\bdpop\b"), "dpop"),
     (re.compile(r"\bpassport\.authenticate\b", re.IGNORECASE), "passport_authenticate"),
@@ -286,19 +341,23 @@ class NodeServiceAnalyzer:
 
     def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
         prefixes = self._collect_express_prefixes(content)
+        routers = self._router_names(content, prefixes)
 
         for match in EXPRESS_ROUTE_PATTERN.finditer(content):
             owner, method, path = match.group(1), match.group(2).upper(), match.group(3)
+            if owner not in routers or not self._is_route_path(path):
+                continue
             prefix = prefixes.get(owner, "")
             full_path = self._join_route(prefix, path)
+            # Express `.all()` matches every verb: core's sentinel is ANY.
+            method = "ANY" if method == "ALL" else method
             self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
-        for match in FASTIFY_ROUTE_PATTERN.finditer(content):
-            method, path = match.group(1).upper(), match.group(2)
-            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # `router.route('/x').get(...).post(...)`
         for match in EXPRESS_ROUTE_OPENER_PATTERN.finditer(content):
             owner, path = match.group(1), match.group(2)
+            if owner not in routers or not self._is_route_path(path):
+                continue
             prefix = prefixes.get(owner, "")
             full_path = self._join_route(prefix, path)
             # Scan forward from the opener for a short window; grab every
@@ -310,7 +369,30 @@ class NodeServiceAnalyzer:
                 window = window[:terminator]
             for verb_match in CHAIN_VERB_PATTERN.finditer(window):
                 verb_line = line_of(content, match.end() + verb_match.start())
-                self._append_unique_route(result, full_path, verb_match.group(1).upper(), relative, verb_line)
+                verb = verb_match.group(1).upper()
+                self._append_unique_route(result, full_path, "ANY" if verb == "ALL" else verb, relative, verb_line)
+
+    @staticmethod
+    def _router_names(content: str, prefixes: dict[str, str]) -> set[str]:
+        """Receivers whose `.get('/x')` etc. declare inbound routes in this file."""
+        names = set(CONVENTIONAL_ROUTER_NAMES)
+        names.update(m.group(1) for m in ROUTER_ASSIGN_PATTERN.finditer(content))
+        names.update(m.group(1) for m in ROUTER_PARAM_PATTERN.finditer(content))
+        # `app.use('/api', v1)`: both sides of a prefix mount are routers.
+        names.update(prefixes)
+        names.update(owner for owner, _prefix, _mounted in EXPRESS_USE_MOUNT_PATTERN.findall(content))
+        return names
+
+    @staticmethod
+    def _client_names(content: str, routers: set[str]) -> set[str]:
+        """HTTP-client receivers in this file (never ones also bound as routers)."""
+        names = set(KNOWN_CLIENT_NAMES)
+        names.update(m.group(1) for m in CLIENT_ASSIGN_PATTERN.finditer(content))
+        return names - routers
+
+    @staticmethod
+    def _is_route_path(path: str) -> bool:
+        return path.startswith("/") or path == "*"
 
     def _collect_express_prefixes(self, content: str) -> dict[str, str]:
         """Walk `app.use('/prefix', router)` mounts to build per-owner prefixes.
@@ -472,6 +554,27 @@ class NodeServiceAnalyzer:
                         result.edge_hints, EdgeHint, f"edge:{service_name}->{target_service}", relative,
                         content=content, offset=match.start(), confidence=0.6,
                     )
+
+        # `axios.get('/internal/health')`, `api.post('https://...')`: outbound
+        # calls with a known verb, so the method is recorded for cross-repo
+        # contract linking.
+        clients = self._client_names(content, self._router_names(content, self._collect_express_prefixes(content)))
+        for match in EXPRESS_ROUTE_PATTERN.finditer(content):
+            owner, verb, target = match.group(1), match.group(2), match.group(3)
+            if owner not in clients or verb not in CLIENT_VERBS:
+                continue
+            # A template literal's interpolation is the dynamic tail:
+            # `/users/${id}` -> `/users/` (core treats a trailing `/` as `*`).
+            target = target.split("${", 1)[0]
+            if not (target.startswith("/") or re.match(r"https?://", target, re.IGNORECASE)):
+                continue
+            self._append_unique_external(result, target, relative, content, match.start(), method=verb.upper())
+            target_service = self._service_from_url(target)
+            if target_service:
+                self._append_unique_hint(
+                    result.edge_hints, EdgeHint, f"edge:{service_name}->{target_service}", relative,
+                    content=content, offset=match.start(), confidence=0.6,
+                )
 
         for match in ENV_URL_PATTERN.finditer(content):
             env_name = match.group(1)
@@ -686,13 +789,18 @@ class NodeServiceAnalyzer:
         result.routes.append(Route(path=path, method=method, file=file, line=line))
 
     @staticmethod
-    def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:
-        key = (target, file)
-        if any((item.target, item.file) == key for item in result.external_calls):
+    def _append_unique_external(
+        result: ScanResult, target: str, file: str, content: str, offset: int, *, method: str | None = None
+    ) -> None:
+        key = (target, method, file)
+        if any((item.target, item.method, item.file) == key for item in result.external_calls):
             return
         line = line_of(content, offset)
         result.external_calls.append(
-            ExternalCall(target=target, file=file, line=line, evidence_text=line_snippet(content, line) or target)
+            ExternalCall(
+                target=target, file=file, line=line, method=method,
+                evidence_text=line_snippet(content, line) or target,
+            )
         )
 
     @staticmethod
