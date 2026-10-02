@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — false-positive routes and noisy hints (#3)
+
+- **Routes need a router receiver and a rooted path.** `<var>.<verb>('...')` used to become a route for any receiver and any string, so `req.get('Authorization')`, `cache.get('session')`, `searchParams.get('page')`, `store.post('/x')` and outbound `axios.get('/internal/health')` all showed up as inbound routes (with a `/` prepended). A match now counts only when the receiver is a router: a name assigned from `express()` / `express.Router()` / `Router()` / `new Router()` / `new Hono()` / `new Koa()` / `new Elysia()` / `fastify()` / `polka()`, a parameter typed `Router` / `Express` / `Application` / `FastifyInstance` / `Hono` / `Elysia`, either side of an `x.use('/prefix', y)` mount, or one of the conventional names `app`, `router`, `server`, `fastify` (untyped `module.exports = (app) => …`). The path literal must start with `/` or be `*`. Verbs are matched case-sensitively. Chained `x.route('/p').get()…` uses the same check.
+- **HTTP-client calls are external calls with a method.** `axios` / `got` / `ky` / `api` / `http` / `client` / `fetcher` / `superagent` / `request` receivers, and instances from `axios.create()` / `got.extend()` / `ky.create()`, are recorded as `ExternalCall`s with `method` set (`axios.get('/internal/health')` → `GET /internal/health`; `axios.post('https://…')` now carries `POST`), so core can link them to another repo's routes. A template literal is cut at its first `${` (`/invoices/${id}` → `/invoices/`, which core treats as a dynamic final segment). External calls are deduplicated by `(target, method, file)`, matching core's merge key.
+- **`signature_verify` / `signature_sign` need a crypto or JWT receiver.** A bare `verify(` / `sign(` fired on almost every JS repo; the hints now need `jwt.` / `jsonwebtoken.` / `jose.` / `crypto.` / `crypto.subtle.` `verify(` / `sign(`, `jwtVerify(`, `new SignJWT(` or `crypto.createVerify(` / `createSign(`.
+- **`postgresql` needs the driver.** The case-insensitive `\bpg\b` matched comments, CSS class names and variables; it now needs `from 'pg'` / `require('pg')` (or `pg-pool`, `pg-promise`, `postgres`) or `node-postgres`. `Pool({…})` still counts.
+- Express `.all()` routes are emitted as `ANY` (core's all-verbs sentinel, as NestJS `@All` already was) instead of `ALL`.
+
 ### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
 
 - **`auth_hints` now carries only auth signals** (`authorization_header`, `bearer_token`, `jwt`, `signature_verify`, `signature_sign`, `oauth`, `dpop`, `passport_authenticate`, `nestjs_guard`). Everything else moved to the typed SDK hint lists, with the same hint strings, so core's service-chain, topology and AT Protocol chain builders still pick them up:
