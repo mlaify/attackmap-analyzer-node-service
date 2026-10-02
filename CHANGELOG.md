@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
+
+- **`auth_hints` now carries only auth signals** (`authorization_header`, `bearer_token`, `jwt`, `signature_verify`, `signature_sign`, `oauth`, `dpop`, `passport_authenticate`, `nestjs_guard`). Everything else moved to the typed SDK hint lists, with the same hint strings, so core's service-chain, topology and AT Protocol chain builders still pick them up:
+  - `service_name:*`, `service_role:*`, `workspace_package:*` → `ServiceHint` (`service_hints`)
+  - `edge:*` (HTTP, env-URL, BullMQ queue and Kafka topic edges) → `EdgeHint` (`edge_hints`)
+  - `entrypoint:*` → `EntrypointHint` (`entrypoint_hints`)
+  - `atproto_lexicon:*` → `ProtocolHint` (`protocol_hints`)
+- **Every signal now cites a line and quotes it.** Routes, external calls, databases, auth/service/edge/entrypoint/protocol hints and secret hints carry `line` and (where the model has it) `evidence_text` from `attackmap.sdk.line_of` / `line_snippet`. Path-derived service hints are anchored at line 1 with `evidence_text: "inferred from path <file>"`; workspace service hints point at the package's `"name"` line. Typed hints set `confidence` (0.9 workspace packages, 0.8 entrypoints/lexicons/queue edges, 0.6 path-inferred service names and HTTP edges, 0.5 env-URL edges and service roles).
+- **Breaking for direct consumers of `ScanResult.auth_hints`:** code that looked for `service_name:`/`edge:`/`entrypoint:`/`atproto_lexicon:` in `auth_hints` must read the typed lists instead. AttackMap core already does.
+- New `tests/test_signal_conformance.py` asserts every emitted `AuthHint.hint` is in an explicit auth allow-list and every signal has an in-range `line` and evidence.
+
 ### Fixed — AttackMap#253
 
 - **Repo walking now uses `attackmap.sdk.fs`.** `detect()` and `analyze()` walk with `iter_repo_files` and read with `read_source`. Skip dirs are matched by repo-relative name and pruned, so a repo checked out under a `build/`, `dist/` or `out/` directory is analyzed instead of yielding nothing, and `node_modules` is never descended.
