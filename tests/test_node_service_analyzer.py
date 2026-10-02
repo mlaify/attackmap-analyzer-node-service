@@ -60,18 +60,23 @@ def test_analyze_extracts_service_signals_and_edges() -> None:
     result = _analyze("node_service_repo")
     route_keys = {(route.path, route.method) for route in result.routes}
     auth_hints = {hint.hint for hint in result.auth_hints}
+    service_hints = {hint.hint for hint in result.service_hints}
+    entrypoints = {hint.hint for hint in result.entrypoint_hints}
+    edges = {hint.hint for hint in result.edge_hints}
     external_targets = {call.target for call in result.external_calls}
     databases = {db.kind for db in result.databases}
     secret_names = {secret.name for secret in result.secret_hints}
 
     assert ("/xrpc/ping", "GET") in route_keys
     assert ("/internal/rebuild", "POST") in route_keys
-    assert "service_name:api" in auth_hints
-    assert "service_role:api" in auth_hints
-    assert "service_name:worker" in auth_hints
-    assert "entrypoint:express_listen" in auth_hints
-    assert "edge:api->worker" in auth_hints
-    assert "edge:api->feedgen" in auth_hints
+    # Typed signals, not overloaded auth hints (AttackMap#258).
+    assert "service_name:api" in service_hints
+    assert "service_role:api" in service_hints
+    assert "service_name:worker" in service_hints
+    assert "entrypoint:express_listen" in entrypoints
+    assert "edge:api->worker" in edges
+    assert "edge:api->feedgen" in edges
+    assert auth_hints == {"bearer_token", "jwt", "signature_sign"}
     assert "https://worker.internal.local/rebuild" in external_targets
     assert "env://FEEDGEN_URL" in external_targets
     assert "postgresql" in databases
@@ -98,10 +103,10 @@ def test_nestjs_decorators_produce_prefixed_routes() -> None:
 
 def test_nestjs_hints_are_emitted() -> None:
     result = _analyze("nestjs_repo")
-    hints = {h.hint for h in result.auth_hints}
-    assert "entrypoint:nestjs_bootstrap" in hints
-    assert "entrypoint:nestjs_module" in hints
-    assert "nestjs_guard" in hints  # @UseGuards()
+    entrypoints = {h.hint for h in result.entrypoint_hints}
+    assert "entrypoint:nestjs_bootstrap" in entrypoints
+    assert "entrypoint:nestjs_module" in entrypoints
+    assert "nestjs_guard" in {h.hint for h in result.auth_hints}  # @UseGuards()
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +173,7 @@ def test_hono_koa_elysia_routes_are_extracted() -> None:
 
 def test_hono_koa_elysia_entrypoints_emit_hints() -> None:
     result = _analyze("framework_variety_repo")
-    hints = {h.hint for h in result.auth_hints}
+    hints = {h.hint for h in result.entrypoint_hints}
     assert "entrypoint:hono_app" in hints
     assert "entrypoint:koa_app" in hints
     assert "entrypoint:elysia_app" in hints
@@ -180,7 +185,7 @@ def test_trpc_procedures_are_extracted_as_prefixed_routes() -> None:
     assert ("trpc:listUsers", "GET") in keys      # .query -> GET
     assert ("trpc:createUser", "POST") in keys    # .mutation -> POST
     assert ("trpc:streamEvents", "STREAM") in keys
-    hints = {h.hint for h in result.auth_hints}
+    hints = {h.hint for h in result.entrypoint_hints}
     assert "entrypoint:trpc_http_server" in hints
 
 
@@ -192,7 +197,8 @@ def test_trpc_procedures_are_extracted_as_prefixed_routes() -> None:
 def test_xrpc_handlers_emit_xrpc_routes_and_lexicon_hints() -> None:
     result = _analyze("xrpc_repo")
     keys = {(r.path, r.method) for r in result.routes}
-    hints = {h.hint for h in result.auth_hints}
+    lexicons = {h.hint for h in result.protocol_hints}
+    entrypoints = {h.hint for h in result.entrypoint_hints}
     # `server.method(...)` form
     assert ("/xrpc/com.atproto.server.createSession", "ANY") in keys
     assert ("/xrpc/app.bsky.feed.getFeed", "ANY") in keys
@@ -200,9 +206,9 @@ def test_xrpc_handlers_emit_xrpc_routes_and_lexicon_hints() -> None:
     assert ("/xrpc/com.atproto.repo.putRecord", "ANY") in keys
     assert ("/xrpc/chat.bsky.convo.getConvo", "ANY") in keys
     # Lexicon hints per NSID
-    assert "atproto_lexicon:com.atproto.server.createSession" in hints
-    assert "atproto_lexicon:app.bsky.feed.getFeed" in hints
-    assert "entrypoint:xrpc_server" in hints
+    assert "atproto_lexicon:com.atproto.server.createSession" in lexicons
+    assert "atproto_lexicon:app.bsky.feed.getFeed" in lexicons
+    assert "entrypoint:xrpc_server" in entrypoints
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +235,7 @@ def test_npm_workspaces_declared_at_root_emit_service_hints_for_each_package() -
     # The existing node_service_repo fixture declares services/* + packages/*
     # in its root package.json workspaces.
     result = _analyze("node_service_repo")
-    hints = {h.hint for h in result.auth_hints}
+    hints = {h.hint for h in result.service_hints}
     assert "workspace_package:@attackmap/node-service-demo" not in hints  # root itself excluded
     # `services/api`, `services/worker`, `packages/shared` each have their
     # own package.json in the fixture — but only if they exist as workspace
@@ -241,7 +247,7 @@ def test_npm_workspaces_declared_at_root_emit_service_hints_for_each_package() -
 
 def test_pnpm_workspace_emits_service_hints_for_each_workspace_package() -> None:
     result = _analyze("pnpm_workspace_repo")
-    hints = {h.hint for h in result.auth_hints}
+    hints = {h.hint for h in result.service_hints}
     assert "service_name:gateway" in hints
     assert "service_name:telemetry" in hints
     assert "workspace_package:@attackmap/gateway" in hints
@@ -255,7 +261,7 @@ def test_pnpm_workspace_emits_service_hints_for_each_workspace_package() -> None
 
 def test_bullmq_workers_and_queues_emit_queue_edges() -> None:
     result = _analyze("async_workers_repo")
-    hints = {h.hint for h in result.auth_hints}
+    hints = {h.hint for h in [*result.entrypoint_hints, *result.edge_hints]}
     targets = {c.target for c in result.external_calls}
     assert "entrypoint:bullmq_worker" in hints
     assert "entrypoint:bullmq_queue" in hints
@@ -267,7 +273,7 @@ def test_bullmq_workers_and_queues_emit_queue_edges() -> None:
 
 def test_kafka_consumer_topics_emit_topic_edges() -> None:
     result = _analyze("async_workers_repo")
-    hints = {h.hint for h in result.auth_hints}
+    hints = {h.hint for h in [*result.entrypoint_hints, *result.edge_hints]}
     targets = {c.target for c in result.external_calls}
     assert "entrypoint:kafka_consumer" in hints
     assert "queue://kafka/orders-created" in targets
@@ -305,7 +311,11 @@ def test_symlinked_source_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
     (repo / "services" / "api" / "src" / "linked.ts").symlink_to(outside / "secret.ts")
 
     result = NodeServiceAnalyzer().analyze(repo)
-    files = {r.file for r in result.routes} | {h.file for h in result.auth_hints} | {s.file for s in result.secret_hints}
+    files = (
+        {r.file for r in result.routes}
+        | {h.file for h in [*result.auth_hints, *result.service_hints, *result.entrypoint_hints]}
+        | {s.file for s in result.secret_hints}
+    )
     assert not any(f.endswith("linked.ts") for f in files)
     assert "/outside-secret" not in {r.path for r in result.routes}
     assert "expo_public:EXPO_PUBLIC_OUTSIDE_KEY" not in {s.name for s in result.secret_hints}
@@ -345,6 +355,23 @@ def test_workspace_globs_do_not_pick_up_node_modules_packages(tmp_path: Path) ->
     nested_dep.mkdir(parents=True)
     (nested_dep / "package.json").write_text('{"name": "left-pad"}')
 
-    hints = {h.hint for h in NodeServiceAnalyzer().analyze(tmp_path).auth_hints}
+    hints = {h.hint for h in NodeServiceAnalyzer().analyze(tmp_path).service_hints}
     assert "workspace_package:@mono/api" in hints
     assert "workspace_package:left-pad" not in hints
+
+
+def test_signals_cite_the_line_they_were_found_on() -> None:
+    # AttackMap#258: routes and hints carry the line of the match, never a
+    # blank line above it (`^\\s*` in MULTILINE mode swallows those).
+    root = FIXTURES / "nextjs_repo"
+    result = NodeServiceAnalyzer().analyze(root)
+    lines = (root / "app/orders/[id]/route.ts").read_text().split("\n")
+    routes = {r.method: r for r in result.routes if r.file == "app/orders/[id]/route.ts"}
+    assert lines[routes["GET"].line - 1].startswith("export async function GET")
+    assert lines[routes["DELETE"].line - 1].startswith("export async function DELETE")
+
+    root = FIXTURES / "node_service_repo"
+    result = NodeServiceAnalyzer().analyze(root)
+    for hint in [*result.auth_hints, *result.edge_hints, *result.entrypoint_hints]:
+        source = (root / hint.file).read_text().split("\n")
+        assert hint.evidence_text == source[hint.line - 1].strip()

@@ -6,9 +6,21 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snippet, read_source, rel
 
-from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, Route, ScanResult, SecretHint
+from .contracts import (
+    AnalyzerMetadata,
+    AuthHint,
+    DatabaseHint,
+    EdgeHint,
+    EntrypointHint,
+    ExternalCall,
+    ProtocolHint,
+    Route,
+    ScanResult,
+    SecretHint,
+    ServiceHint,
+)
 
 CODE_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".tsx"}
 # Pruned by repo-relative directory name (attackmap.sdk.fs, AttackMap#253).
@@ -243,8 +255,17 @@ class NodeServiceAnalyzer:
             service_name = self._infer_service_name(relative, root_package_name)
             service_role = self._infer_service_role(service_name, relative)
 
-            self._append_unique_auth(result, f"service_name:{service_name}", relative)
-            self._append_unique_auth(result, f"service_role:{service_role}", relative)
+            # Service identity is inferred from the file's path (or the root
+            # package name), not from a source line: anchor it at line 1.
+            derived = f"inferred from path {relative}"
+            self._append_unique_hint(
+                result.service_hints, ServiceHint, f"service_name:{service_name}", relative,
+                evidence=derived, confidence=0.6,
+            )
+            self._append_unique_hint(
+                result.service_hints, ServiceHint, f"service_role:{service_role}", relative,
+                evidence=derived, confidence=0.5,
+            )
 
             self._extract_routes(content, relative, result)
             self._extract_nestjs_routes(content, relative, result)
@@ -270,10 +291,10 @@ class NodeServiceAnalyzer:
             owner, method, path = match.group(1), match.group(2).upper(), match.group(3)
             prefix = prefixes.get(owner, "")
             full_path = self._join_route(prefix, path)
-            self._append_unique_route(result, full_path, method, relative)
+            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
         for match in FASTIFY_ROUTE_PATTERN.finditer(content):
             method, path = match.group(1).upper(), match.group(2)
-            self._append_unique_route(result, path, method, relative)
+            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # `router.route('/x').get(...).post(...)`
         for match in EXPRESS_ROUTE_OPENER_PATTERN.finditer(content):
@@ -288,7 +309,8 @@ class NodeServiceAnalyzer:
             if terminator != -1:
                 window = window[:terminator]
             for verb_match in CHAIN_VERB_PATTERN.finditer(window):
-                self._append_unique_route(result, full_path, verb_match.group(1).upper(), relative)
+                verb_line = line_of(content, match.end() + verb_match.start())
+                self._append_unique_route(result, full_path, verb_match.group(1).upper(), relative, verb_line)
 
     def _collect_express_prefixes(self, content: str) -> dict[str, str]:
         """Walk `app.use('/prefix', router)` mounts to build per-owner prefixes.
@@ -349,13 +371,13 @@ class NodeServiceAnalyzer:
             verb, sub_path = match.group(1).upper(), (match.group(2) or "")
             full_path = self._join_route(prefix, sub_path)
             method = "ANY" if verb == "ALL" else verb
-            self._append_unique_route(result, full_path, method, relative)
+            self._append_unique_route(result, full_path, method, relative, line_of(content, match.start()))
 
     def _extract_trpc_procedures(self, content: str, relative: str, result: ScanResult) -> None:
         for match in TRPC_PROCEDURE_PATTERN.finditer(content):
             name, kind = match.group(1), match.group(2).lower()
             method = "POST" if kind in {"mutation"} else "GET" if kind == "query" else "STREAM"
-            self._append_unique_route(result, f"trpc:{name}", method, relative)
+            self._append_unique_route(result, f"trpc:{name}", method, relative, line_of(content, match.start()))
 
     def _extract_xrpc_handlers(self, content: str, relative: str, result: ScanResult) -> None:
         seen: set[str] = set()
@@ -364,15 +386,21 @@ class NodeServiceAnalyzer:
             if nsid in seen:
                 continue
             seen.add(nsid)
-            self._append_unique_route(result, f"/xrpc/{nsid}", "ANY", relative)
-            self._append_unique_auth(result, f"atproto_lexicon:{nsid}", relative)
+            self._append_unique_route(result, f"/xrpc/{nsid}", "ANY", relative, line_of(content, match.start()))
+            self._append_unique_hint(
+                result.protocol_hints, ProtocolHint, f"atproto_lexicon:{nsid}", relative,
+                content=content, offset=match.start(), confidence=0.8,
+            )
         for match in XRPC_LEXICON_KEY_PATTERN.finditer(content):
             nsid = match.group(1)
             if nsid in seen:
                 continue
             seen.add(nsid)
-            self._append_unique_route(result, f"/xrpc/{nsid}", "ANY", relative)
-            self._append_unique_auth(result, f"atproto_lexicon:{nsid}", relative)
+            self._append_unique_route(result, f"/xrpc/{nsid}", "ANY", relative, line_of(content, match.start()))
+            self._append_unique_hint(
+                result.protocol_hints, ProtocolHint, f"atproto_lexicon:{nsid}", relative,
+                content=content, offset=match.start(), confidence=0.8,
+            )
 
     def _extract_nextjs_file_routes(
         self, file_path: Path, root: Path, content: str, result: ScanResult
@@ -387,7 +415,10 @@ class NodeServiceAnalyzer:
             url_path = "/" + "/".join(self._nextjs_segment(s) for s in segments)
             url_path = url_path.rstrip("/") or "/"
             for match in NEXTJS_APP_ROUTE_EXPORT_PATTERN.finditer(content):
-                self._append_unique_route(result, url_path, match.group(1).upper(), relative)
+                # group(1), not start(): `^\s*` in MULTILINE also swallows blank lines above.
+                self._append_unique_route(
+                    result, url_path, match.group(1).upper(), relative, line_of(content, match.start(1))
+                )
             return
 
         # Pages Router: `pages/api/**/*.ts`. Every file under `pages/api/` is
@@ -405,7 +436,10 @@ class NodeServiceAnalyzer:
                     segments = segments[:-1] + [last]
                 url_path = "/api/" + "/".join(self._nextjs_segment(s) for s in segments)
                 url_path = url_path.rstrip("/") or "/api"
-                self._append_unique_route(result, url_path, "ANY", relative)
+                # The default export is the handler; fall back to line 1.
+                default_export = re.search(r"^[ \t]*export\s+default\b", content, re.MULTILINE)
+                line = line_of(content, default_export.start()) if default_export else 1
+                self._append_unique_route(result, url_path, "ANY", relative, line)
 
     @staticmethod
     def _nextjs_segment(segment: str) -> str:
@@ -418,8 +452,12 @@ class NodeServiceAnalyzer:
 
     def _extract_entrypoint_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, hint in ENTRYPOINT_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_auth(result, hint, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_unique_hint(
+                    result.entrypoint_hints, EntrypointHint, hint, relative,
+                    content=content, offset=match.start(), confidence=0.8,
+                )
 
     def _extract_outbound_and_edges(
         self, content: str, relative: str, service_name: str, result: ScanResult
@@ -427,58 +465,74 @@ class NodeServiceAnalyzer:
         for pattern in OUTBOUND_PATTERNS:
             for match in pattern.finditer(content):
                 target = match.group(1)
-                self._append_unique_external(result, target, relative)
+                self._append_unique_external(result, target, relative, content, match.start())
                 target_service = self._service_from_url(target)
                 if target_service:
-                    self._append_unique_auth(result, f"edge:{service_name}->{target_service}", relative)
+                    self._append_unique_hint(
+                        result.edge_hints, EdgeHint, f"edge:{service_name}->{target_service}", relative,
+                        content=content, offset=match.start(), confidence=0.6,
+                    )
 
         for match in ENV_URL_PATTERN.finditer(content):
             env_name = match.group(1)
-            self._append_unique_external(result, f"env://{env_name}", relative)
+            self._append_unique_external(result, f"env://{env_name}", relative, content, match.start())
             target_service = self._service_from_env_name(env_name)
             if target_service:
-                self._append_unique_auth(result, f"edge:{service_name}->{target_service}", relative)
+                self._append_unique_hint(
+                    result.edge_hints, EdgeHint, f"edge:{service_name}->{target_service}", relative,
+                    content=content, offset=match.start(), confidence=0.5,
+                )
 
     def _extract_async_worker_edges(
         self, content: str, relative: str, service_name: str, result: ScanResult
     ) -> None:
         for match in BULLMQ_QUEUE_NAME_PATTERN.finditer(content):
             queue = match.group(1)
-            self._append_unique_external(result, f"queue://bullmq/{queue}", relative)
-            self._append_unique_auth(result, f"edge:{service_name}->queue:{queue}", relative)
+            self._append_unique_external(result, f"queue://bullmq/{queue}", relative, content, match.start())
+            self._append_unique_hint(
+                result.edge_hints, EdgeHint, f"edge:{service_name}->queue:{queue}", relative,
+                content=content, offset=match.start(), confidence=0.8,
+            )
         for match in KAFKA_TOPIC_PATTERN.finditer(content):
             topic = match.group(1) or match.group(2)
             if not topic:
                 continue
-            self._append_unique_external(result, f"queue://kafka/{topic}", relative)
-            self._append_unique_auth(result, f"edge:{service_name}->topic:{topic}", relative)
+            self._append_unique_external(result, f"queue://kafka/{topic}", relative, content, match.start())
+            self._append_unique_hint(
+                result.edge_hints, EdgeHint, f"edge:{service_name}->topic:{topic}", relative,
+                content=content, offset=match.start(), confidence=0.8,
+            )
 
     def _extract_datastore_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_database(result, kind, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_unique_database(result, kind, relative, content, match.start())
 
     def _extract_auth_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, hint in AUTH_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_auth(result, hint, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_unique_hint(
+                    result.auth_hints, AuthHint, hint, relative, content=content, offset=match.start()
+                )
 
     def _extract_secret_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern in SECRET_PATTERNS:
             for match in pattern.finditer(content):
-                self._append_unique_secret(result, match.group(1), relative)
+                self._append_unique_secret(result, match.group(1), relative, content, match.start())
         for match in EXPO_PUBLIC_PATTERN.finditer(content):
             # Expo prefix means the value is inlined into the client
             # bundle at build time — an important distinction downstream
             # findings should elevate. Tag it with an "expo_public:" prefix
             # so the finder can recognize it.
-            self._append_unique_secret(result, f"expo_public:{match.group(1)}", relative)
+            self._append_unique_secret(result, f"expo_public:{match.group(1)}", relative, content, match.start())
 
     def _emit_workspace_service_hints(self, root: Path, result: ScanResult) -> None:
         """Read package.json `workspaces` (npm/yarn) and pnpm-workspace.yaml.
 
-        For each workspace package, emit a `service_name:<pkg>` auth hint
-        anchored at the package's package.json. This gives downstream
+        For each workspace package, emit a `service_name:<pkg>` service hint
+        anchored at the package's package.json `"name"` line. This gives downstream
         threat-model chain builders visibility into repos where services
         live outside `services/*` / `packages/*`.
         """
@@ -552,8 +606,14 @@ class NodeServiceAnalyzer:
             return
         seen.add(short)
         relative = rel(pkg_json, root)
-        self._append_unique_auth(result, f"service_name:{short}", relative)
-        self._append_unique_auth(result, f"workspace_package:{pkg_name}", relative)
+        text = read_source(pkg_json, root=root) or ""
+        name_match = re.search(r'"name"\s*:', text)
+        offset = name_match.start() if name_match else None
+        for hint in (f"service_name:{short}", f"workspace_package:{pkg_name}"):
+            self._append_unique_hint(
+                result.service_hints, ServiceHint, hint, relative,
+                content=text, offset=offset, confidence=0.9,
+            )
 
     def _infer_service_name(self, relative: str, root_package_name: str | None) -> str:
         normalized = relative.replace("\\", "/")
@@ -619,36 +679,67 @@ class NodeServiceAnalyzer:
         return next(iter_repo_files(root, names={name}, skip_dirs=SKIP_DIRS), None) is not None
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:
+    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
-        result.routes.append(Route(path=path, method=method, file=file))
+        result.routes.append(Route(path=path, method=method, file=file, line=line))
 
     @staticmethod
-    def _append_unique_external(result: ScanResult, target: str, file: str) -> None:
+    def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:
         key = (target, file)
         if any((item.target, item.file) == key for item in result.external_calls):
             return
-        result.external_calls.append(ExternalCall(target=target, file=file))
+        line = line_of(content, offset)
+        result.external_calls.append(
+            ExternalCall(target=target, file=file, line=line, evidence_text=line_snippet(content, line) or target)
+        )
 
     @staticmethod
-    def _append_unique_database(result: ScanResult, kind: str, file: str) -> None:
+    def _append_unique_database(result: ScanResult, kind: str, file: str, content: str, offset: int) -> None:
         key = (kind, file)
         if any((item.kind, item.file) == key for item in result.databases):
             return
-        result.databases.append(DatabaseHint(kind=kind, file=file))
+        line = line_of(content, offset)
+        result.databases.append(
+            DatabaseHint(kind=kind, file=file, line=line, evidence_text=line_snippet(content, line) or kind)
+        )
 
     @staticmethod
-    def _append_unique_auth(result: ScanResult, hint: str, file: str) -> None:
-        key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.auth_hints):
+    def _append_unique_hint(
+        bucket: list,
+        model: type,
+        hint: str,
+        file: str,
+        *,
+        content: str | None = None,
+        offset: int | None = None,
+        evidence: str | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        """Append a typed hint (Auth/Service/Edge/Entrypoint/Protocol) once per (hint, file).
+
+        With ``content`` + ``offset`` the hint is located at that line and
+        quotes it; without (path-derived hints) it is anchored at line 1 and
+        ``evidence`` explains where it came from.
+        """
+        if any((item.hint, item.file) == (hint, file) for item in bucket):
             return
-        result.auth_hints.append(AuthHint(hint=hint, file=file))
+        if content is not None and offset is not None:
+            line = line_of(content, offset)
+            evidence_text = line_snippet(content, line) or evidence or hint
+        else:
+            line = 1
+            evidence_text = evidence or hint
+        extra = {"confidence": confidence} if confidence is not None else {}
+        bucket.append(model(hint=hint, file=file, line=line, evidence_text=evidence_text, **extra))
 
     @staticmethod
-    def _append_unique_secret(result: ScanResult, name: str, file: str) -> None:
+    def _append_unique_secret(result: ScanResult, name: str, file: str, content: str, offset: int) -> None:
         key = (name, file)
         if any((item.name, item.file) == key for item in result.secret_hints):
             return
-        result.secret_hints.append(SecretHint(name=name, file=file))
+        line = line_of(content, offset)
+        result.secret_hints.append(
+            SecretHint(name=name, file=file, line=line, evidence_text=line_snippet(content, line) or name)
+        )
