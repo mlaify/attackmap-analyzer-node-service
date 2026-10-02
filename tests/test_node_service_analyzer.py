@@ -1,4 +1,9 @@
+import os
+import shutil
+import sys
 from pathlib import Path
+
+import pytest
 
 from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
 from attackmap.sdk.models import ScanResult as SharedScanResult
@@ -268,3 +273,78 @@ def test_kafka_consumer_topics_emit_topic_edges() -> None:
     assert "queue://kafka/orders-created" in targets
     assert "queue://kafka/payments-events" in targets
     assert any(h.endswith("->topic:orders-created") for h in hints)
+
+
+# ---------------------------------------------------------------------------
+# Repo walking via attackmap.sdk.fs (AttackMap#253)
+# ---------------------------------------------------------------------------
+
+
+def test_repo_checked_out_under_build_dir_is_still_analyzed(tmp_path: Path) -> None:
+    # Skip dirs used to be matched against absolute path parts, so a repo
+    # under any `build/` or `out/` directory yielded nothing at all.
+    repo = tmp_path / "build" / "out" / "repo"
+    shutil.copytree(FIXTURES / "node_service_repo", repo)
+    analyzer = NodeServiceAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned > 0
+    assert result.routes
+    assert result.external_calls
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_source_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.ts").write_text(
+        "app.get('/outside-secret', handler);\nconst k = process.env.EXPO_PUBLIC_OUTSIDE_KEY;\n"
+    )
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURES / "node_service_repo", repo)
+    (repo / "services" / "api" / "src" / "linked.ts").symlink_to(outside / "secret.ts")
+
+    result = NodeServiceAnalyzer().analyze(repo)
+    files = {r.file for r in result.routes} | {h.file for h in result.auth_hints} | {s.file for s in result.secret_hints}
+    assert not any(f.endswith("linked.ts") for f in files)
+    assert "/outside-secret" not in {r.path for r in result.routes}
+    assert "expo_public:EXPO_PUBLIC_OUTSIDE_KEY" not in {s.name for s in result.secret_hints}
+
+
+def test_detect_does_not_walk_node_modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only node_modules has Node files: detect() must neither match them nor
+    # descend into node_modules (it used to `root.glob("**/package.json")`).
+    dep = tmp_path / "node_modules" / "express"
+    dep.mkdir(parents=True)
+    (dep / "package.json").write_text('{"name": "express"}')
+    (dep / "tsconfig.json").write_text("{}")
+    (dep / "server.js").write_text("app.listen(3000)\n")
+    (tmp_path / "README.md").write_text("not a node service\n")
+
+    entered: list[str] = []
+    real_walk = os.walk
+
+    def spy(top, *args, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, *args, **kwargs):
+            entered.append(Path(dirpath).name)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(os, "walk", spy)
+    assert NodeServiceAnalyzer().detect(tmp_path) is False
+    assert entered, "detect() should walk the repo via the SDK walker"
+    assert "node_modules" not in entered and "express" not in entered
+
+
+def test_workspace_globs_do_not_pick_up_node_modules_packages(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"name": "mono", "workspaces": ["packages/**"]}')
+    pkg = tmp_path / "packages" / "api"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text('{"name": "@mono/api"}')
+    (pkg / "index.ts").write_text("app.get('/x', h);\n")
+    nested_dep = pkg / "node_modules" / "left-pad"
+    nested_dep.mkdir(parents=True)
+    (nested_dep / "package.json").write_text('{"name": "left-pad"}')
+
+    hints = {h.hint for h in NodeServiceAnalyzer().analyze(tmp_path).auth_hints}
+    assert "workspace_package:@mono/api" in hints
+    assert "workspace_package:left-pad" not in hints
