@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
+from attackmap.sdk import DEFAULT_SKIP_DIRS, contained_file, iter_repo_files, read_source, rel
 
 SKIP_DIRS = DEFAULT_SKIP_DIRS | {".svelte-kit"}
 
@@ -291,8 +291,7 @@ class ModuleResolver:
             if current is None or current in seen:
                 break
             if current not in raw:
-                assert self.root is not None
-                data = load_jsonc(read_source(self.root / current, root=self.root) or "")
+                data = load_jsonc(self._read_config(current) or "")
                 if not isinstance(data, dict):
                     break
                 raw[current] = data
@@ -311,6 +310,23 @@ class ModuleResolver:
                     following = target if target.endswith(".json") else target + ".json"
             current = following
         return found
+
+    def _read_config(self, relative: str) -> str | None:
+        """An ``extends`` target, held to the walker's rules: a regular file
+        inside the repo (no symlinks), outside pruned directories such as
+        ``node_modules``, and within the config size cap."""
+        assert self.root is not None
+        if any(part in SKIP_DIRS for part in relative.split("/")[:-1]):
+            return None
+        path = contained_file(self.root, relative)
+        if path is None:
+            return None
+        try:
+            if not path.is_file() or path.stat().st_size > _MAX_CONFIG_BYTES:
+                return None
+        except OSError:
+            return None
+        return read_source(path, root=self.root)
 
     # -- workspace packages --
 

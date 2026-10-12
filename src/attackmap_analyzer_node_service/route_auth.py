@@ -81,6 +81,8 @@ _MAX_DEPTH = 16  # mount levels followed
 _MAX_PATHS = 64  # mount paths explored per route
 _MAX_VARIANTS = 8  # distinct mounted paths emitted per route
 _MAX_USES = 32  # guarding use() calls kept per router
+_MAX_GUARDS = 8  # guards kept per use() / mount / route registration
+_MAX_MIDDLEWARE_ARGS = 64  # middleware arguments inspected per call
 _MAX_CHAIN = 256  # calls followed in one chain
 _MAX_REEXPORT_DEPTH = 6
 _MAX_STAR_EXPORTS = 16
@@ -232,7 +234,7 @@ _NOT_GUARD_NAME = re.compile(
 _INLINE_VERIFY = re.compile(r"\.\s*jwtVerify\s*\(")
 _FUNCTION_START = re.compile(r"\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)")
 _UNLESS = re.compile(r"\.\s*unless\s*\(")
-_ANONYMOUS_STRATEGY = re.compile(r"""\s*['"]anonymous['"]""")
+_ANONYMOUS_STRATEGY = re.compile(r"""['"]anonymous['"]""")
 _SPACES = re.compile(r"\s+")
 _NEW = re.compile(r"^new\s+")
 
@@ -325,9 +327,13 @@ def guard_from_arg(content: str, start: int, end: int, context: str | None = Non
     name = _SPACES.sub("", match.group(1))
     if guard_kind(name) is None:
         return None
-    if name.endswith("passport.authenticate") or name == "passport.authenticate":
+    if name.endswith("passport.authenticate"):
+        # `passport.authenticate('anonymous')` / `(['jwt', 'anonymous'])` admit
+        # callers without credentials.
         paren = content.find("(", match.end(), end)
-        if paren >= 0 and _ANONYMOUS_STRATEGY.match(content, paren + 1, end):
+        close = matching_close(content, paren) if paren >= 0 else -1
+        args = split_args(content, paren, close) if 0 < close <= end else []
+        if args and _ANONYMOUS_STRATEGY.search(content, args[0][0], args[0][1]):
             return None
     return Guard(name, evidence, _unless(content, start, end))
 
@@ -339,7 +345,7 @@ def guard_only_registration(content: str, spans: list[tuple[int, int]], context:
     """The guards of a route registration whose every argument is a guard,
     else []. Passport's ``local`` strategy there is the login handler itself."""
     guards: list[Guard] = []
-    for start, end in flatten(content, spans):
+    for start, end in flatten(content, spans)[:_MAX_MIDDLEWARE_ARGS]:
         guard = guard_from_arg(content, start, end, context)
         if guard is None:
             return []
@@ -348,7 +354,7 @@ def guard_only_registration(content: str, spans: list[tuple[int, int]], context:
             if paren >= 0 and _LOGIN_STRATEGY.match(content, paren + 1, end):
                 return []
         guards.append(guard)
-    return guards
+    return guards[:_MAX_GUARDS]
 
 
 def flatten(content: str, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -382,11 +388,11 @@ def route_option_guards(content: str, start: int, end: int, context: str) -> lis
         key = _HOOK_KEYS.match(content, ps, pe)
         if not key:
             continue
-        for vs, ve in flatten(content, [(key.end(), pe)]):
+        for vs, ve in flatten(content, [(key.end(), pe)])[:_MAX_MIDDLEWARE_ARGS]:
             guard = guard_from_arg(content, vs, ve, context)
             if guard:
                 guards.append(guard)
-    return guards
+    return guards[:_MAX_GUARDS]
 
 
 # ---------- Functions ----------
@@ -507,6 +513,11 @@ _CALL_HEAD = re.compile(
     rf"|register|onBeforeHandle)\s*\("
 )
 _WS = re.compile(r"(?:\s|//[^\n]{0,500}\n|/\*(?:[^*]|\*(?!/)){0,500}\*/)*")
+def skip_space(content: str, pos: int) -> int:
+    """The offset after whitespace and comments at ``pos`` (bounded)."""
+    return _WS.match(content, pos).end()
+
+
 _LINK = re.compile(rf"\.\s*({_IDENT})\s*(?:<[^()<>;]{{0,200}}>\s*)?\(")
 # Chainable calls that return the same app (Hono / Elysia / Express / Fastify).
 _PASSTHROUGH = frozenset(
@@ -536,6 +547,7 @@ _EXPORT_LIST = re.compile(r"\bexport\s*\{([^{}]{0,1000})\}(?!\s*from)")
 _CJS_EXPORT = re.compile(rf"\b(?:module\s*\.\s*)?exports\s*\.\s*({_IDENT})\s*=(?!=)")
 _EXPORT_AS = re.compile(rf"^\s*({_IDENT})(?:\s+as\s+({_IDENT}))?\s*$")
 _CONVENTIONAL = frozenset({"app", "router", "server", "fastify"})
+_PATH_VARIABLE = re.compile(rf"{_IDENT}(?:\s*\.\s*{_IDENT})*")
 _KEYWORDS = frozenset(
     {"if", "for", "while", "switch", "catch", "function", "return", "typeof", "await", "new", "require", "import",
      "super", "with", "void", "delete", "in", "of", "do", "else", "case", "throw", "yield"}
@@ -551,13 +563,37 @@ def join_path(prefix: str, path: str) -> str:
 
 
 def _under(path: str, prefix: str) -> bool:
-    """Express/Hono path-prefix match (`/api` covers `/api` and `/api/x`)."""
+    """Express/Hono path-prefix match (`/api` covers `/api` and `/api/x`;
+    `/api/*` covers `/api/x` but not `/api`, as in Express 4)."""
+    if prefix.endswith("/*"):
+        return path.startswith(prefix[:-1])
     prefix = prefix.rstrip("*")
     if prefix in ("", "/"):
         return True
     if prefix.endswith("/"):
         return path.startswith(prefix) or path == prefix.rstrip("/")
     return path == prefix or path.startswith(prefix + "/")
+
+
+_FN_BODY_ARROW = re.compile(r"=>\s*$")
+_FN_BODY_AFTER_PARAMS = re.compile(r"\)\s*(?::[^{};()=]{1,150})?\s*$")
+_CONTROL_KEYWORD = re.compile(r"(?:\b(?:if|for|while|switch|catch|with)|\bfor\s+await)\s*$")
+
+
+def _is_function_body(content: str, open_idx: int, opens: dict[int, int]) -> bool:
+    """True when the ``{`` at ``open_idx`` opens a function / method / arrow
+    body (not a class, object literal or ``if`` / ``for`` block)."""
+    head = content[max(0, open_idx - 200) : open_idx]
+    if _FN_BODY_ARROW.search(head):
+        return True
+    params = _FN_BODY_AFTER_PARAMS.search(head)
+    if not params:
+        return False
+    close = open_idx - len(head) + params.start()
+    paren = opens.get(close)
+    if paren is None:
+        return False
+    return not _CONTROL_KEYWORD.search(content, max(0, paren - 20), paren)
 
 
 class FileRouters:
@@ -569,9 +605,13 @@ class FileRouters:
         self._length = len(content)
         pairs = bracket_pairs(content)
         blocks = sorted((o, c) for o, c in pairs.items() if content[o] == "{")
+        # A router passed in as a parameter is bound per function: the
+        # outermost function body around a call (a class or object literal
+        # isn't one, so each method gets its own).
+        opens = {c: o for o, c in pairs.items() if content[o] == "("}
         self._top: list[tuple[int, int]] = []
         for block in blocks:
-            if not self._top or block[0] > self._top[-1][1]:
+            if (not self._top or block[0] > self._top[-1][1]) and _is_function_body(content, block[0], opens):
                 self._top.append(block)
         self._top_starts = [s for s, _ in self._top]
         self._blocks = blocks
@@ -866,36 +906,75 @@ class FileRouters:
         if not args:
             return verb != "route"
         prefix: str | None = None
+        prefixes: list[str] | None = None  # `use(['/a', '/b'], mw)`
+        unknown_path = False  # `use(API_PREFIX, mw)`, `use(/^\/api/, mw)`
         first = string_literal(self.content[args[0][0] : args[0][1]])
         if first is not None:
             prefix, args = first, args[1:]
         elif verb in ("all", "route"):
             return True  # `.all(handler)`, Fastify `.route({ ... })`
+        elif len(args) > 1:
+            kind = self._path_argument(*args[0])
+            if kind is not None:
+                args = args[1:]
+                if isinstance(kind, list):
+                    prefixes = kind
+                else:
+                    unknown_path = True
         if verb == "route" and not args:
             return False
         if verb == "all" and not prefix.endswith("*"):
             return True  # a real `.all('/x', h)` route, not a catch-all guard
         context = self._context(offset, close)
-        args = flatten(self.content, args)
+        args = flatten(self.content, args)[:_MAX_MIDDLEWARE_ARGS]
         target = self._mount_target(*args[-1], verb) if args and verb in ("use", "route") else None
         middleware = args[:-1] if target is not None else args
         guards = [] if verb == "route" else [
             g for s, e in middleware if (g := guard_from_arg(self.content, s, e, context))
-        ]
+        ][:_MAX_GUARDS]
+        if unknown_path:
+            # A path this file can't read: the guard may not cover the route.
+            guards = [Guard(g.name, g.evidence, uncertain=True) for g in guards]
         if target is not None:
-            mount = Mount(owner, offset, prefix or "", guards, self)
-            if isinstance(target, Binding):
-                if target is not owner:
-                    target.mounts.append(mount)
-            else:
-                self.import_mounts.append((target, mount))
+            for mount_prefix in (prefixes or [prefix or ""])[:_MAX_GUARDS]:
+                mount = Mount(owner, offset, mount_prefix, guards, self)
+                if isinstance(target, Binding):
+                    if target is not owner:
+                        target.mounts.append(mount)
+                else:
+                    self.import_mounts.append((target, mount))
             return True
         if not guards:
             return True
-        for guard in guards:
-            guard.prefix = prefix
+        if prefixes is not None:
+            # One copy per literal prefix of `use(['/a', '/b'], mw)`.
+            guards = [
+                Guard(g.name, g.evidence, g.skip, g.uncertain, p) for p in prefixes[:_MAX_GUARDS] for g in guards
+            ][:_MAX_GUARDS * 2]
+        else:
+            for guard in guards:
+                guard.prefix = prefix
         self._add_use(owner, offset, guards)
         return True
+
+    def _path_argument(self, start: int, end: int) -> list[str] | bool | None:
+        """What a non-string first ``use()`` argument is: a list of literal
+        paths, True for a path this file can't read (a regex, a template, a
+        variable such as ``API_PREFIX``), or None for middleware."""
+        s, e = _strip_span(self.content, start, end)
+        text = self.content[s:e]
+        if text.startswith("["):
+            close = matching_close(self.content, s)
+            items = split_args(self.content, s, close) if close > 0 else []
+            literals = [string_literal(self.content[a:b]) for a, b in items]
+            if items and all(lit is not None for lit in literals):
+                return literals  # type: ignore[return-value]
+            return True
+        if text.startswith(("/", "`")):
+            return True  # a regex or template literal
+        if _PATH_VARIABLE.fullmatch(text) and guard_kind(text) is None and self.resolve(text, s, create=False) is None:
+            return True  # a bare identifier / member that isn't middleware we know
+        return None
 
     def _add_use(self, owner: Binding, offset: int, guards: list[Guard]) -> None:
         if len(owner.uses) >= _MAX_USES:
@@ -906,7 +985,10 @@ class FileRouters:
     def _hooks(self, owner: Binding, offset: int, paren: int, close: int, first: int) -> None:
         args = split_args(self.content, paren, close)[first:]
         context = self._context(offset, close)
-        guards = [g for s, e in flatten(self.content, args) if (g := guard_from_arg(self.content, s, e, context))]
+        guards = [
+            g for s, e in flatten(self.content, args)[:_MAX_MIDDLEWARE_ARGS]
+            if (g := guard_from_arg(self.content, s, e, context))
+        ][:_MAX_GUARDS]
         if guards:
             self._add_use(owner, offset, guards)
 
@@ -960,7 +1042,7 @@ class FileRouters:
         context = self._context(offset, close)
         callback = function_at(self.content, args[-1][0], args[-1][1])
         options = args[:-1] if callback else args
-        guards = [g for s, e in options for g in route_option_guards(self.content, s, e, context)]
+        guards = [g for s, e in options for g in route_option_guards(self.content, s, e, context)][:_MAX_GUARDS]
         if callback is None:
             if guards and not with_prefix:
                 self._add_use(owner, offset, guards)
@@ -1103,6 +1185,8 @@ class Registry:
         self.files: dict[str, FileRouters] = {}
         self.reexports: dict[str, Reexports] = {}
         self.resolver = resolver or ModuleResolver(None)
+        self._export_memo: dict[tuple[str, str], Binding | None] = {}
+        self._module_memo: dict[tuple[str, str], str | None] = {}
 
     def add(self, routers: FileRouters) -> None:
         self.files[routers.file] = routers
@@ -1115,31 +1199,54 @@ class Registry:
                 self.reexports[file] = reexports
 
     def resolve_module(self, importer: str, spec: str) -> str | None:
-        for base in self.resolver.bases(importer, spec):
-            for candidate in file_candidates(base):
-                if candidate in self.files or candidate in self.reexports:
-                    return candidate
-        return None
+        key = (importer, spec)
+        if key not in self._module_memo:
+            self._module_memo[key] = next(
+                (
+                    candidate
+                    for base in self.resolver.bases(importer, spec)
+                    for candidate in file_candidates(base)
+                    if candidate in self.files or candidate in self.reexports
+                ),
+                None,
+            )
+        return self._module_memo[key]
 
-    def lookup_export(self, file: str, name: str, depth: int = 0) -> Binding | None:
+    def lookup_export(self, file: str, name: str) -> Binding | None:
+        """The binding ``file`` exports as ``name``, through re-exports.
+        Memoized, and no (module, name) is visited twice in one lookup, so
+        `export *` cycles stay linear."""
         if name == "*":
             name = "default"
+        return self._lookup(file, name, 0, set())
+
+    def _lookup(self, file: str, name: str, depth: int, visiting: set[tuple[str, str]]) -> Binding | None:
+        key = (file, name)
+        if key in self._export_memo:
+            return self._export_memo[key]
+        if key in visiting or depth >= _MAX_REEXPORT_DEPTH:
+            return None
+        visiting.add(key)
+        found: Binding | None = None
         routers = self.files.get(file)
         if routers is not None and name in routers.exports:
-            return routers.exports[name]
-        reexports = routers.reexports if routers is not None else self.reexports.get(file)
-        if reexports is None or depth >= _MAX_REEXPORT_DEPTH:
-            return None
-        ref = reexports.named.get(name)
-        if ref is not None:
-            target = self.resolve_module(file, ref.spec)
-            return self.lookup_export(target, ref.name, depth + 1) if target else None
-        for spec in reexports.star[:_MAX_STAR_EXPORTS]:
-            target = self.resolve_module(file, spec)
-            found = self.lookup_export(target, name, depth + 1) if target else None
-            if found is not None:
-                return found
-        return None
+            found = routers.exports[name]
+        else:
+            reexports = routers.reexports if routers is not None else self.reexports.get(file)
+            ref = reexports.named.get(name) if reexports is not None else None
+            if ref is not None:
+                target = self.resolve_module(file, ref.spec)
+                found = self._lookup(target, ref.name, depth + 1, visiting) if target else None
+            elif reexports is not None:
+                for spec in reexports.star[:_MAX_STAR_EXPORTS]:
+                    target = self.resolve_module(file, spec)
+                    found = self._lookup(target, name, depth + 1, visiting) if target else None
+                    if found is not None:
+                        break
+        if found is not None or depth == 0:
+            # A miss deep in a cycle may only be a cut-off: cache it from the top.
+            self._export_memo[key] = found
+        return found
 
     def finalize(self) -> None:
         """Attach cross-file mounts to the export they mount. Mounts made by

@@ -82,9 +82,9 @@ EXPRESS_USE_MOUNT_PATTERN = re.compile(
 
 # Chained `router.route('/path').get(...).post(...)` shape. Handler bodies
 # often contain their own parens (`res.status(200).end()`), so a single
-# balanced-paren regex won't hold. Match the `.route(...)` opener alone
-# and scan forward from its end with CHAIN_VERB_PATTERN for the chained
-# verbs, terminating at the first line that doesn't start with `.`.
+# balanced-paren regex won't hold. Match the `.route(...)` opener alone,
+# then follow the chain one call at a time: CHAIN_VERB_PATTERN must match right
+# after the previous call's closing paren (whitespace and comments allowed).
 EXPRESS_ROUTE_OPENER_PATTERN = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*route\(\s*['\"]([^'\"]+)['\"]\s*\)",
 )
@@ -92,7 +92,7 @@ CHAIN_VERB_PATTERN = re.compile(
     r"\.\s*(get|post|put|patch|delete|options|head|all)\s*\(",
     re.IGNORECASE,
 )
-CHAIN_WINDOW = 800  # chars scanned after `.route(...)` for chained verbs
+CHAIN_WINDOW = 800  # bound on the scan for each chained verb
 
 # Fastify's full declaration: `fastify.route({ method: 'GET', url: '/x', handler })`
 # (`method` may be a list; `path` is an alias of `url`).
@@ -380,8 +380,10 @@ class NodeServiceAnalyzer:
 
     def _expand_routes(self, result: ScanResult) -> None:
         """Replace each deferred route by one route per mounted path, with its
-        auth, then deduplicate by (path, method, file); a resolved duplicate
-        fills in an unknown first one."""
+        auth, then deduplicate by (path, method, file). Duplicates that
+        disagree on auth become ``unknown``: which registration serves the
+        request depends on order, and a guarded copy must not vouch for an
+        unguarded one."""
         pending = dict(self._auth_pending)
         routes: list[Route] = []
         seen: dict[tuple[str, str, str], int] = {}
@@ -391,8 +393,10 @@ class NodeServiceAnalyzer:
                 key = (path, route.method, route.file)
                 if key in seen:
                     existing = routes[seen[key]]
-                    if existing.auth == ra.UNKNOWN and resolution.auth != ra.UNKNOWN:
-                        routes[seen[key]] = self._with_auth(existing, path, resolution)
+                    if existing.auth != resolution.auth and existing.auth != ra.UNKNOWN:
+                        routes[seen[key]] = Route(
+                            path=existing.path, method=existing.method, file=existing.file, line=existing.line
+                        )
                     continue
                 seen[key] = len(routes)
                 if path == route.path and resolution.auth == ra.UNKNOWN:
@@ -412,6 +416,19 @@ class NodeServiceAnalyzer:
         return existing
 
     @staticmethod
+    def _registers_guard(content: str, after_path: int) -> bool:
+        """Whether a registration's arguments after its path include a guard."""
+        paren = content.rfind("(", 0, after_path)
+        close = ra.matching_close(content, paren)
+        if close < 0:
+            return False
+        context = content[paren : min(close + 1, paren + 400)]
+        return any(
+            ra.guard_from_arg(content, s, e, context)
+            for s, e in ra.flatten(content, ra.split_args(content, paren, close)[1:])[:64]
+        )
+
+    @staticmethod
     def _local_guards(content: str, paren: int, first: int, start: int) -> list[ra.Guard]:
         """Auth middleware among a registration's arguments from ``first`` up
         to (not including) the handler; Fastify route options count too."""
@@ -424,10 +441,11 @@ class NodeServiceAnalyzer:
         guards: list[ra.Guard] = []
         for s, e in args:
             guards += ra.route_option_guards(content, s, e, context)
-        for s, e in ra.flatten(content, args):
+        for s, e in ra.flatten(content, args)[:64]:
             guard = ra.guard_from_arg(content, s, e, context)
             if guard is not None:
                 guards.append(guard)
+        guards = guards[:8]
         # `app.get('/api/Users', security.isAuthorized())`: a registration made
         # only of guards is path middleware; the handler is registered later.
         return ra.guard_only_registration(content, every, context) or guards
@@ -472,6 +490,9 @@ class NodeServiceAnalyzer:
                 continue
             prefix = prefixes.get(owner, "")
             full_path = self._join_route(prefix, path)
+            # `app.all('/api/*', requireAuth)` is middleware, not a route.
+            if method == "ALL" and path.endswith("*") and self._registers_guard(content, match.end() - 1):
+                continue
             # Express `.all()` matches every verb: core's sentinel is ANY.
             method = "ANY" if method == "ALL" else method
             index = self._append_route(result, full_path, method, relative, line_of(content, match.start()))
@@ -485,20 +506,24 @@ class NodeServiceAnalyzer:
                 continue
             prefix = prefixes.get(owner, "")
             full_path = self._join_route(prefix, path)
-            # Scan forward from the opener for a short window; grab every
-            # chained verb until the trail visibly ends (statement-ending
-            # semicolon or a non-chain identifier at line start).
-            window = content[match.end() : match.end() + CHAIN_WINDOW]
-            terminator = window.find(";")
-            if terminator != -1:
-                window = window[:terminator]
-            for verb_match in CHAIN_VERB_PATTERN.finditer(window):
-                verb_line = line_of(content, match.end() + verb_match.start())
+            # Follow the chain call by call (`.get(h)` then `.post(h)` ...); a
+            # later statement's `app.get(` is not part of it, even without `;`.
+            pos = match.end()
+            for _ in range(32):
+                verb_match = CHAIN_VERB_PATTERN.match(content, ra.skip_space(content, pos), pos + CHAIN_WINDOW)
+                if not verb_match:
+                    break
+                paren = verb_match.end() - 1
+                close = ra.matching_close(content, paren)
+                if close < 0:
+                    break
                 verb = verb_match.group(1).upper()
-                index = self._append_route(result, full_path, "ANY" if verb == "ALL" else verb, relative, verb_line)
-                paren = match.end() + verb_match.end() - 1
+                index = self._append_route(
+                    result, full_path, "ANY" if verb == "ALL" else verb, relative, line_of(content, verb_match.start())
+                )
                 local = self._local_guards(content, paren, 0, match.start())
                 defer(index, owner, match.start(), path, local, full_path)
+                pos = close + 1
 
         if fr is None:
             return

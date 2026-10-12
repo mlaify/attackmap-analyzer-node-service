@@ -366,3 +366,159 @@ def test_adversarial_sources_stay_fast(tmp_path: Path, text: str) -> None:
     started = time.monotonic()
     NodeServiceAnalyzer().analyze(tmp_path)
     assert time.monotonic() - started < 20
+
+
+# ---------- Never `required` by mistake (review of #17) ----------
+
+
+def test_duplicate_registrations_that_disagree_are_unknown(tmp_path: Path) -> None:
+    # Express serves the first `/x`; the guarded copy must not vouch for it.
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.get('/x', h);\napp.get('/x', requireAuth, h);\n"
+        "app.post('/y', requireAuth, h);\napp.post('/y', requireAuth, h2);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /x"].auth == "unknown"
+    assert routes["POST /y"].auth == "required"
+
+
+def test_route_chain_without_semicolons_stops_at_the_next_statement(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express')\nconst app = express()\n"
+        "app.route('/api/Users/:id')\n  .get(security.isAuthorized())\n  .put(security.denyAll())\n"
+        "app.post('/api/Products', security.isAuthorized())\n"
+        "app.get('/api/Complaints', h)\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /api/Users/:id"].auth == "required"
+    assert sorted(k for k in routes if k.endswith("/api/Users/:id")) == ["GET /api/Users/:id", "PUT /api/Users/:id"]
+
+
+def test_two_routers_at_one_prefix_that_disagree_are_unknown(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "const open = express.Router();\nconst closed = express.Router();\n"
+        "open.get('/me', h);\nclosed.get('/me', h);\n"
+        "app.use('/api', open);\napp.use('/api', requireAuth, closed);\n",
+        encoding="utf-8",
+    )
+    assert _routes(tmp_path)["GET /api/me"].auth == "unknown"
+
+
+def test_each_method_binds_its_own_router_parameter(tmp_path: Path) -> None:
+    (tmp_path / "routes.js").write_text(
+        "class Routes {\n"
+        "  priv(router) {\n    router.use(requireAuth);\n    router.post('/settings', h);\n  }\n"
+        "  pub(router) {\n    router.get('/status', h);\n  }\n"
+        "}\nmodule.exports = Routes;\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["POST /settings"].auth == "required"
+    assert routes["GET /status"].auth == "unknown"
+
+
+def test_wildcard_guard_does_not_cover_its_base_path(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.all('/api/*', requireAuth);\napp.use('/admin/*', requireAuth);\n"
+        "app.get('/api', h);\napp.get('/api/users', h);\napp.get('/admin', h);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /api"].auth == "unknown"
+    assert routes["GET /admin"].auth == "unknown"
+    assert routes["GET /api/users"].auth == "required"
+    # The guard registration isn't a route.
+    assert "ANY /api/*" not in routes
+
+
+def test_use_with_a_non_literal_path(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.use(['/a', '/b'], requireAuth);\n"
+        "app.use(API_PREFIX, requireAuth);\n"
+        "app.use(/^\\/c/, requireAuth);\n"
+        "app.get('/a/x', h);\napp.get('/b', h);\napp.get('/c', h);\napp.get('/d', h);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /a/x"].guards == ["requireAuth"]
+    assert routes["GET /b"].auth == "required"
+    # A variable or regex path could be anything: never `required` from it.
+    assert routes["GET /c"].auth == "unknown"
+    assert routes["GET /d"].auth == "unknown"
+
+
+def test_router_mounted_at_a_list_of_prefixes(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\nconst r = express.Router();\n"
+        "r.get('/x', h);\napp.use(['/v1', '/v2'], requireAuth, r);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /v1/x"].auth == "required" and routes["GET /v2/x"].auth == "required"
+
+
+def test_passport_strategy_list_with_anonymous_is_not_a_guard(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.post('/a', passport.authenticate(['jwt', 'anonymous'], { session: false }), h);\n"
+        "app.post('/b', passport.authenticate(['jwt', 'bearer']), h);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["POST /a"].auth == "unknown"
+    assert routes["POST /b"].auth == "required"
+
+
+def test_tsconfig_extends_outside_rules_is_not_read(tmp_path: Path) -> None:
+    (tmp_path / "node_modules" / "cfg").mkdir(parents=True)
+    (tmp_path / "node_modules" / "cfg" / "tsconfig.json").write_text(
+        '{"compilerOptions": {"paths": {"@/*": ["src/*"]}}}', encoding="utf-8"
+    )
+    (tmp_path / "big.json").write_text(
+        '{"compilerOptions": {"paths": {"#/*": ["src/*"]}}, "x": "' + "a" * 300_000 + '"}', encoding="utf-8"
+    )
+    (tmp_path / "linked.json").symlink_to(tmp_path / "node_modules" / "cfg" / "tsconfig.json")
+    resolver = ModuleResolver(tmp_path)
+    for target in ("./node_modules/cfg/tsconfig.json", "./big.json", "./linked.json"):
+        (tmp_path / "tsconfig.json").write_text(f'{{"extends": "{target}"}}', encoding="utf-8")
+        resolver = ModuleResolver(tmp_path)
+        assert resolver.bases("src/a.ts", "@/x") == [] and resolver.bases("src/a.ts", "#/x") == []
+
+
+# ---------- Performance (review of #17) ----------
+
+
+def test_export_star_cycles_stay_fast(tmp_path: Path) -> None:
+    for i in range(16):
+        stars = "".join(f"export * from './m{j}';\n" for j in range(16))
+        (tmp_path / f"m{i}.ts").write_text(stars, encoding="utf-8")
+    (tmp_path / "app.ts").write_text(
+        "import express from 'express';\nimport { users } from './m0';\nconst app = express();\n"
+        + "".join(f"app.use('/p{k}', users);\n" for k in range(50)),
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    NodeServiceAnalyzer().analyze(tmp_path)
+    # Without the export memo and visited set this took minutes.
+    assert time.monotonic() - started < 2
+
+
+def test_many_guards_per_use_stay_fast(tmp_path: Path) -> None:
+    use = "app.use(" + ", ".join(["requireAuth"] * 3000) + ");\n"
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        + use * 32
+        + "".join(f"app.post('/r{k}', h);\n" for k in range(2000)),
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    routes = _routes(tmp_path)
+    # Without the per-call guard and argument caps this took ~20 s.
+    assert time.monotonic() - started < 5
+    assert routes["POST /r1999"].auth == "required"
