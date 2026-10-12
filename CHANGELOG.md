@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — cross-file mount paths, chained routers, Fastify / Hono / Elysia mounts (#4)
+
+- **Routes carry their mount prefixes across files.** `app.use('/api/users', requireAuth, usersRouter)` in `app.js` now emits `routes/users.js`'s `router.get('/:id')` as `GET /api/users/:id` (it used to be `GET /:id`), with the mount's middleware as guards. A router mounted at several prefixes gives one route per path (at most 8), each with its own auth. Same-file prefixes work as before; a router no visible code mounts keeps its file-local path.
+- **Import map.** `require(...)` (also inline: `app.use('/x', require('./x'))`, `require('./routes')(app)`), default / named / namespace `import`s, barrel re-exports (`export { x } from`, `export * from`, `module.exports = require(...)`), `index` files, `compilerOptions.paths` / `baseUrl` from the nearest `tsconfig.json` / `jsconfig.json` (following relative `extends`), and workspace packages by `package.json` name. Specifiers that leave the repo are dropped; mounts made by test files are ignored.
+- **More mount forms:** Fastify `register(plugin, { prefix })` with a same-file function or an imported plugin (`fastify-plugin` wrapped plugins ignore `prefix`, as in Fastify), Hono `route('/x', sub)` and `basePath('/x')`, Elysia `new Elysia({ prefix })`, `group('/x', (g) => ...)` and `guard({ beforeHandle }, (g) => ...)`, and route functions called with the app (`usersRoutes(app)`).
+- **Chained calls:** `new Hono().use(mw).get('/x', h).route('/y', sub)`, Elysia chains and `app.get(...).post(...)` are read call by call (Hono's RPC style used to yield no routes at all).
+- **New route forms:** Fastify `X.route({ method, url })` (method lists too) and NestJS `@Controller({ path, version })`. A file with several NestJS controllers gives each route its own controller's prefix.
+- **Role checks are guards** (`requireRole('admin')`, `isAdmin`, `authorize(...)`, `checkPermissions`, `guard.check(...)`), so a role applied at mount time reaches core's function-level authorization check through `guards`. NestJS `RolesGuard` / `PermissionsGuard`-style guards count next to their `@Roles(...)` / `@Permissions(...)` metadata.
+- A registration made only of guards (`app.get('/api/Users', security.isAuthorized())`) guards that path; Passport's `local` strategy there is the login handler, not a guard.
+
+### Fixed — guard names (#4)
+
+- **Guards are recognized by the whole name, not a substring.** `auth` / `jwt` anywhere in a name made `security.updateAuthenticatedUsers()` and `verify.jwtChallenges()` guards, which marked 108 of juice-shop's routes `required`. Names now have to say they authenticate (`requireAuth`, `isAuthenticated`, `verifyToken`, `*Auth`, ...) or check a role. `security.isAuthorized()` is now recognized.
+- NestJS `Optional...` guards (e.g. cal.com's `OptionalApiAuthGuard`) admit anonymous callers and no longer make a route `required`.
+
 ### Added — route-level auth (#9, AttackMap#256; part of #4)
 
 - **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the middleware / guard and `guard_evidence` quoting the registration that attached it. AttackMap ≥ 0.6 trusts this over its own same-file resolution and its ±40-line auth-hint window. Older cores ignore the fields, and the file-level `nestjs_guard` / `passport_authenticate` hints are kept for one release.

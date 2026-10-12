@@ -1,0 +1,7 @@
+{
+  // Comments and trailing commas are valid in tsconfig.json.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "strict": true,
+  },
+}
