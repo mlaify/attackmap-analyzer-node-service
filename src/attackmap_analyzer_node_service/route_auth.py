@@ -1166,6 +1166,9 @@ class Resolution:
     auth: str = UNKNOWN
     guards: list[str] = field(default_factory=list)
     evidence: str | None = None
+    # The routers each mount chain ends at (by identity): routes reaching one
+    # app by the same path and method are the same endpoint to Express.
+    roots: frozenset[int] = field(default_factory=frozenset)
 
 
 _TEST_DIRS = frozenset({"tests", "test", "__tests__", "spec", "specs", "testing", "e2e", "__mocks__", "fixtures"})
@@ -1269,21 +1272,29 @@ class Registry:
         if binding is None:
             return [(fallback, Resolution())]
         chains = self._paths(binding, offset, path, list(local), 0, [_MAX_PATHS])
-        mounted = any(full != path for _, full, _ in chains)
+        mounted = any(full != path for _, full, _, _ in chains)
         grouped: dict[str, list[Resolution]] = {}
-        for guards, full, complete in chains:
+        roots: dict[str, set[int]] = {}
+        for guards, full, complete, root in chains:
             key = full if mounted else fallback
             if key in grouped or len(grouped) < _MAX_VARIANTS:
                 grouped.setdefault(key, []).append(evaluate(guards, full if complete else None, complete))
-        return [(key, combine(results)) for key, results in grouped.items()]
+                roots.setdefault(key, set()).add(root)
+        out: list[tuple[str, Resolution]] = []
+        for key, results in grouped.items():
+            resolution = combine(results)
+            resolution.roots = frozenset(roots[key])
+            out.append((key, resolution))
+        return out
 
     def _paths(
         self, binding: Binding, offset: int, rel_path: str, applied: list[Guard], depth: int, budget: list[int]
-    ) -> list[tuple[list[Guard], str, bool]]:
-        """Every (guards, path, whole chain seen) from a route up to a root."""
+    ) -> list[tuple[list[Guard], str, bool, int]]:
+        """Every (guards, path, whole chain seen, top router) from a route up
+        to a root."""
         budget[0] -= 1
         if binding.overflow or depth >= _MAX_DEPTH or budget[0] < 0:
-            return [(applied, rel_path, False)]
+            return [(applied, rel_path, False, id(binding))]
         applied = list(applied)
         for use_offset, guards in binding.uses:
             if use_offset >= offset:
@@ -1293,10 +1304,10 @@ class Registry:
                     applied.append(guard)
         up_path = join_path(binding.prefix, rel_path)
         if not binding.mounts:
-            return [(applied, up_path, binding.root)]
+            return [(applied, up_path, binding.root, id(binding))]
         if len(binding.mounts) > _MAX_PATHS:
-            return [(applied, up_path, False)]
-        out: list[tuple[list[Guard], str, bool]] = []
+            return [(applied, up_path, False, id(binding))]
+        out: list[tuple[list[Guard], str, bool, int]] = []
         for mount in binding.mounts:
             prefix = "" if binding.skip_prefix else mount.prefix
             out += self._paths(mount.owner, mount.offset, join_path(prefix, up_path), applied + mount.guards, depth + 1, budget)

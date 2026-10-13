@@ -522,3 +522,54 @@ def test_many_guards_per_use_stay_fast(tmp_path: Path) -> None:
     # Without the per-call guard and argument caps this took ~20 s.
     assert time.monotonic() - started < 5
     assert routes["POST /r1999"].auth == "required"
+
+
+def test_two_routers_from_other_files_at_one_prefix_are_unknown(tmp_path: Path) -> None:
+    # Express serves `open`'s `/me` first; `closed`'s guard doesn't protect it.
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "const open = require('./open');\nconst closed = require('./closed');\n"
+        "app.use('/api', open);\napp.use('/api', requireAuth, closed);\n",
+        encoding="utf-8",
+    )
+    router = "const express = require('express');\nconst r = express.Router();\n{}module.exports = r;\n"
+    (tmp_path / "open.js").write_text(router.format("r.get('/me', h);\n"), encoding="utf-8")
+    (tmp_path / "closed.js").write_text(router.format("r.get('/me', h);\nr.get('/only', h);\n"), encoding="utf-8")
+    # A different app serving the same path is a different endpoint.
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.use(requireAuth);\napp.get('/api/me', h);\n",
+        encoding="utf-8",
+    )
+    routes = {(r.file, f"{r.method} {r.path}"): r for r in NodeServiceAnalyzer().analyze(tmp_path).routes}
+    assert routes[("open.js", "GET /api/me")].auth == "unknown"
+    assert routes[("closed.js", "GET /api/me")].auth == "unknown"
+    assert routes[("closed.js", "GET /api/only")].auth == "required"
+    assert routes[("other/server.js", "GET /api/me")].auth == "required"
+
+
+# ---------- With core's merge: built-in twins (AttackMap#337 / #352) ----------
+
+
+def test_core_drops_the_builtin_twin_of_a_mounted_route(tmp_path: Path) -> None:
+    analyzers = pytest.importorskip("attackmap.analyzers")
+    if not hasattr(analyzers, "is_builtin_analyzer"):
+        pytest.skip("core without built-in/plugin twin merging (AttackMap#352)")
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\nconst users = require('./users');\n"
+        "app.use('/api/users', requireAuth, users);\napp.listen(3000);\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "users.js").write_text(
+        "const express = require('express');\nconst router = express.Router();\n"
+        "router.post('/:id/delete', (req, res) => res.sendStatus(204));\nmodule.exports = router;\n",
+        encoding="utf-8",
+    )
+    result = analyzers.analyze_repository(
+        tmp_path, analyzers=[analyzers.BuiltinJavaScriptWebAnalyzer(), NodeServiceAnalyzer()]
+    )
+    posts = [r for r in result.routes if r.file == "users.js" and r.method == "POST"]
+    # Core's extractor reads `POST /:id/delete` with no auth; the plugin's
+    # mounted route supersedes it.
+    assert [(r.path, r.auth) for r in posts] == [("/api/users/:id/delete", "required")]

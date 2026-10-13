@@ -381,29 +381,44 @@ class NodeServiceAnalyzer:
     def _expand_routes(self, result: ScanResult) -> None:
         """Replace each deferred route by one route per mounted path, with its
         auth, then deduplicate by (path, method, file). Duplicates that
-        disagree on auth become ``unknown``: which registration serves the
-        request depends on order, and a guarded copy must not vouch for an
-        unguarded one."""
+        disagree on auth become ``unknown``: Express serves the first
+        registration, which this order-free resolution can't name, and a
+        guarded copy must not vouch for an unguarded one. That holds across
+        files too, for routes that reach the same app (two routers mounted
+        at one prefix)."""
         pending = dict(self._auth_pending)
         routes: list[Route] = []
         seen: dict[tuple[str, str, str], int] = {}
+        endpoints: dict[tuple[str, str, int], list[int]] = {}
         for index, route in enumerate(result.routes):
             variants = pending[index]() if index in pending else [(route.path, ra.Resolution())]  # type: ignore[operator]
             for path, resolution in variants:
                 key = (path, route.method, route.file)
                 if key in seen:
-                    existing = routes[seen[key]]
-                    if existing.auth != resolution.auth and existing.auth != ra.UNKNOWN:
-                        routes[seen[key]] = Route(
-                            path=existing.path, method=existing.method, file=existing.file, line=existing.line
-                        )
-                    continue
-                seen[key] = len(routes)
-                if path == route.path and resolution.auth == ra.UNKNOWN:
-                    routes.append(route)
+                    at = seen[key]
+                    if routes[at].auth != resolution.auth:
+                        routes[at] = self._unknown(routes[at])
                 else:
-                    routes.append(self._with_auth(route, path, resolution))
+                    at = seen[key] = len(routes)
+                    if path == route.path and resolution.auth == ra.UNKNOWN:
+                        routes.append(route)
+                    else:
+                        routes.append(self._with_auth(route, path, resolution))
+                for root in resolution.roots:
+                    group = endpoints.setdefault((path, route.method, root), [])
+                    if at not in group:
+                        group.append(at)
+        for group in endpoints.values():
+            if len({routes[at].auth for at in group}) > 1:
+                for at in group:
+                    routes[at] = self._unknown(routes[at])
         result.routes = routes
+
+    @staticmethod
+    def _unknown(route: Route) -> Route:
+        if route.auth == ra.UNKNOWN:
+            return route
+        return Route(path=route.path, method=route.method, file=route.file, line=route.line)
 
     def _file_routers(self, content: str, relative: str) -> ra.FileRouters | None:
         registry = getattr(self, "_auth_registry", None)
