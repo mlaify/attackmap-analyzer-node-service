@@ -455,12 +455,13 @@ def test_express_guards_from_use_route_args_and_cross_file_mounts() -> None:
     assert settings.auth == "required"
     assert settings.guards == ["expressjwt"]
     assert settings.guard_evidence.startswith("app.use( expressjwt(")
-    # routes/users.js is mounted from app.js after the app-level JWT guard...
-    create = routes["src/routes/users.js POST /"]
+    # routes/users.js is mounted at /api/users from app.js, after the
+    # app-level JWT guard: the route carries the prefix and the guard...
+    create = routes["src/routes/users.js POST /api/users"]
     assert create.auth == "required"
     assert create.guards == ["expressjwt"]
     # ...and route-local middleware adds to it.
-    delete = routes["src/routes/users.js DELETE /:id"]
+    delete = routes["src/routes/users.js DELETE /api/users/:id"]
     assert delete.guards == ["requireAdmin", "expressjwt"]
     assert delete.guard_evidence.startswith("router.delete('/:id', requireAdmin, deleteUser)")
     # Registered before the guard: Express runs middleware in order.
@@ -481,8 +482,9 @@ def test_fastify_route_options_and_register_hooks() -> None:
     orders = routes["src/server.js POST /orders"]
     assert orders.auth == "required"
     assert orders.guards == ["app.authenticate"]
-    # addHook inside a register() plugin guards that plugin's routes only.
-    payments = routes["src/server.js POST /payments"]
+    # addHook inside a register() plugin guards that plugin's routes only,
+    # which sit under the register() prefix.
+    payments = routes["src/server.js POST /v1/payments"]
     assert payments.auth == "required"
     assert payments.guards == ["jwtVerify"]
     assert routes["src/server.js POST /webhooks"].auth == "unknown"

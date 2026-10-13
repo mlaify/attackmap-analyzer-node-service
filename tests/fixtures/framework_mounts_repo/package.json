@@ -1,0 +1,4 @@
+{
+  "name": "framework-mounts",
+  "dependencies": { "fastify": "^4.26.0", "fastify-plugin": "^4.5.0", "hono": "^4.4.0", "elysia": "^1.1.0", "@nestjs/core": "^10.0.0" }
+}

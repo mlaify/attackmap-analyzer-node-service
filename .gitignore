@@ -56,3 +56,6 @@ Icon
 ._*
 .Spotlight-V100
 .Trashes
+
+# pytest basetemp (tmp_path) when TMPDIR points into the tree
+pytest-of-*/

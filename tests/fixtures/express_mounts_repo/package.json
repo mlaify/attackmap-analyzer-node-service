@@ -1,0 +1,5 @@
+{
+  "name": "express-mounts",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}
