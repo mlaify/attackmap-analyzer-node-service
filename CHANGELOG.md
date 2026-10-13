@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **License metadata uses an SPDX expression (PEP 639).** `license = "MIT"` and `license-files = ["LICENSE"]` replace the deprecated `license = {text = "MIT"}` table, and the `License ::` classifier (which setuptools ≥ 77 rejects next to an expression) is gone. The build backend floor is now `setuptools>=77` (mlaify/AttackMap#259).
+- **Import the analyzer contract from `attackmap.sdk` directly; `contracts.py` is gone.** It only re-exported SDK types (and aliased `AnalyzerProtocol` as `AttackMapAnalyzerProtocol`), and its four copy-pasted variants drifted across the plugins (mlaify/AttackMap#259).
 - Skip list is now the SDK's `DEFAULT_SKIP_DIRS` plus `.svelte-kit` (adds `vendor`, `target`, `venv`, `.venv`, `.tox`, `bower_components` and caches).
 - Files are visited in sorted, depth-first order, so signal order is deterministic across filesystems. The set of signals is unchanged.
 - Requires an AttackMap core that ships `attackmap.sdk.fs`.
