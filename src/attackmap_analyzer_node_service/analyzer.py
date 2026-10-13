@@ -7,23 +7,28 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snippet, read_source, rel
-
-from . import route_auth as ra
-from .modules import ModuleResolver
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     EdgeHint,
     EntrypointHint,
     ExternalCall,
+    iter_repo_files,
+    line_of,
+    line_snippet,
     ProtocolHint,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
+from . import route_auth as ra
+from .modules import ModuleResolver
 
 CODE_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".tsx"}
 # Pruned by repo-relative directory name (attackmap.sdk.fs, AttackMap#253).

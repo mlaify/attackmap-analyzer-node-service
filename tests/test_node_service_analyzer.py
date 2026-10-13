@@ -7,7 +7,7 @@ import pytest
 
 from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
 from attackmap.sdk.models import ScanResult as SharedScanResult
-from attackmap_analyzer_node_service.contracts import AnalyzerMetadata, ScanResult
+from attackmap.sdk import AnalyzerMetadata, ScanResult
 from attackmap_analyzer_node_service import NodeServiceAnalyzer
 
 FIXTURES = Path(__file__).parent / "fixtures"
