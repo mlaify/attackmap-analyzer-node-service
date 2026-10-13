@@ -92,6 +92,9 @@ CHAIN_VERB_PATTERN = re.compile(
     r"\.\s*(get|post|put|patch|delete|options|head|all)\s*\(",
     re.IGNORECASE,
 )
+# A path parameter segment (`:id`, `{id}`, `[id]`, `:id?`), compared by
+# position only when matching copies of one route.
+_PATH_PARAM = re.compile(r"(?<=/)(?::[^/]{1,200}|\{[^/{}]{1,200}\}|\[[^/\[\]]{1,200}\])")
 CHAIN_WINDOW = 800  # bound on the scan for each chained verb
 
 # Fastify's full declaration: `fastify.route({ method: 'GET', url: '/x', handler })`
@@ -385,11 +388,13 @@ class NodeServiceAnalyzer:
         registration, which this order-free resolution can't name, and a
         guarded copy must not vouch for an unguarded one. That holds across
         files too, for routes that reach the same app (two routers mounted
-        at one prefix)."""
+        at one prefix). Copies overlap when their paths are equal up to
+        parameter names (`/users/:id`, `/users/:userId`) and their methods
+        are equal or either is ANY (`app.all`)."""
         pending = dict(self._auth_pending)
         routes: list[Route] = []
         seen: dict[tuple[str, str, str], int] = {}
-        endpoints: dict[tuple[str, str, int], list[int]] = {}
+        endpoints: dict[tuple[str, object], list[int]] = {}
         for index, route in enumerate(result.routes):
             variants = pending[index]() if index in pending else [(route.path, ra.Resolution())]  # type: ignore[operator]
             for path, resolution in variants:
@@ -404,14 +409,20 @@ class NodeServiceAnalyzer:
                         routes.append(route)
                     else:
                         routes.append(self._with_auth(route, path, resolution))
-                for root in resolution.roots:
-                    group = endpoints.setdefault((path, route.method, root), [])
-                    if at not in group:
+                shape = _PATH_PARAM.sub(":", path.rstrip("/") or "/")
+                for scope in (route.file, *resolution.roots):
+                    group = endpoints.setdefault((shape, scope), [])
+                    if at not in group and len(group) < 256:
                         group.append(at)
         for group in endpoints.values():
-            if len({routes[at].auth for at in group}) > 1:
-                for at in group:
-                    routes[at] = self._unknown(routes[at])
+            if len(group) < 2 or len({routes[at].auth for at in group}) < 2:
+                continue
+            methods = {routes[at].method for at in group}
+            for method in methods - {"ANY"} or {"ANY"}:
+                overlapping = [at for at in group if routes[at].method in (method, "ANY")]
+                if len({routes[at].auth for at in overlapping}) > 1:
+                    for at in overlapping:
+                        routes[at] = self._unknown(routes[at])
         result.routes = routes
 
     @staticmethod

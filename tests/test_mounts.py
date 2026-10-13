@@ -573,3 +573,117 @@ def test_core_drops_the_builtin_twin_of_a_mounted_route(tmp_path: Path) -> None:
     # Core's extractor reads `POST /:id/delete` with no auth; the plugin's
     # mounted route supersedes it.
     assert [(r.path, r.auth) for r in posts] == [("/api/users/:id/delete", "required")]
+
+
+# ---------- Round 2 of the #17 review ----------
+
+
+def test_all_route_overlaps_a_later_guarded_verb(tmp_path: Path) -> None:
+    # Express serves GET /data from the earlier `.all`.
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.all('/data', h);\napp.get('/data', requireAuth, h);\n"
+        "app.post('/other', requireAuth, h);\napp.get('/other', h);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /data"].auth == "unknown"
+    assert routes["ANY /data"].auth == "unknown"
+    # Different verbs on one path don't overlap.
+    assert routes["POST /other"].auth == "required"
+
+
+def test_copies_differing_only_in_parameter_names_overlap(tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text(
+        "const express = require('express');\nconst app = express();\n"
+        "app.get('/users/:id', h);\napp.get('/users/:userId', requireAuth, h);\n"
+        "app.get('/teams/:id', requireAuth, h);\napp.get('/teams/:id/members', h);\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["GET /users/:userId"].auth == "unknown"
+    assert routes["GET /users/:id"].auth == "unknown"
+    assert routes["GET /teams/:id"].auth == "required"
+
+
+def test_sibling_helpers_bind_their_own_router_parameter(tmp_path: Path) -> None:
+    (tmp_path / "routes.js").write_text(
+        "module.exports = function setup(app) {\n"
+        "  const secure = (router) => {\n    router.use(requireAuth);\n    router.post('/settings', h);\n  };\n"
+        "  const open = (router) => {\n    router.get('/health', h);\n  };\n"
+        "  function legacy(router: Router, opts = {}) {\n    router.get('/legacy', h);\n  }\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    routes = _routes(tmp_path)
+    assert routes["POST /settings"].auth == "required"
+    assert routes["GET /health"].auth == "unknown"
+    assert routes["GET /legacy"].auth == "unknown"
+
+
+def test_function_params_parser() -> None:
+    def params(src: str) -> list[str] | None:
+        pairs = ra.bracket_pairs(src)
+        opens = {c: o for o, c in pairs.items() if src[o] == "("}
+        return ra._function_params(src, src.rindex("{"), opens)
+
+    assert params("const f = (router) => {") == ["router"]
+    assert params("const f = router => {") == ["router"]
+    # Destructured parameters bind no router name.
+    assert params("const f = async (r: Router, { a, b } = {}, ...rest): Promise<void> => {") == ["r", "rest"]
+    assert params("function f(app, opts = {}) {") == ["app", "opts"]
+    assert params("if (router) {") is None
+    assert params("const o = {") is None
+
+
+def test_export_lookups_expand_each_module_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A name exported somewhere, looked up through an `export *` web that
+    # never reaches it: every (module, name) is expanded once in the scan.
+    n = 300
+    for i in range(n):
+        stars = "".join(f"export * from './m{(i * 7 + j) % n}';\n" for j in range(1, 17))
+        (tmp_path / f"m{i}.ts").write_text(
+            f"import express from 'express';\nimport {{ ghost }} from './m{(i + 1) % n}';\n"
+            f"const app = express();\napp.use('/p{i}', ghost);\n{stars}",
+            encoding="utf-8",
+        )
+    (tmp_path / "ghost.ts").write_text(
+        "import express from 'express';\nexport const ghost = express.Router();\nghost.get('/x', h);\n",
+        encoding="utf-8",
+    )
+    calls = [0]
+    original = ra.Registry._lookup
+
+    def counting(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls[0] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ra.Registry, "_lookup", counting)
+    NodeServiceAnalyzer().analyze(tmp_path)
+    # Each of the n modules once, plus one call per star edge that finds it
+    # memoized. Caching only top-level misses made this ~n * 256.
+    assert calls[0] <= n * 17 + n
+
+
+def test_export_star_web_with_missing_names_stays_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    n = 2000
+    for i in range(n):
+        stars = "".join(f"export * from './m{(i * 31 + j) % n}';\n" for j in range(1, 17))
+        (tmp_path / f"m{i}.ts").write_text(
+            f"import express from 'express';\nimport {{ missing{i} }} from './m{(i + 1) % n}';\n"
+            f"const app = express();\napp.use('/p', missing{i});\n{stars}",
+            encoding="utf-8",
+        )
+    calls = [0]
+    original = ra.Registry._lookup
+
+    def counting(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls[0] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ra.Registry, "_lookup", counting)
+    started = time.monotonic()
+    NodeServiceAnalyzer().analyze(tmp_path)
+    assert time.monotonic() - started < 10
+    # No module exports any of these names: no walk at all.
+    assert calls[0] == 0

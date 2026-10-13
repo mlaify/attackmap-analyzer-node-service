@@ -85,6 +85,7 @@ _MAX_GUARDS = 8  # guards kept per use() / mount / route registration
 _MAX_MIDDLEWARE_ARGS = 64  # middleware arguments inspected per call
 _MAX_CHAIN = 256  # calls followed in one chain
 _MAX_REEXPORT_DEPTH = 6
+_MAX_LOOKUP_STEPS = 256  # modules expanded per export lookup
 _MAX_STAR_EXPORTS = 16
 
 
@@ -577,23 +578,55 @@ def _under(path: str, prefix: str) -> bool:
 
 _FN_BODY_ARROW = re.compile(r"=>\s*$")
 _FN_BODY_AFTER_PARAMS = re.compile(r"\)\s*(?::[^{};()=]{1,150})?\s*$")
+_ARROW_PARAM = re.compile(rf"(?<![\w$.])({_IDENT})\s*$")
+_PARAM_NAME = re.compile(rf"(?:^|,)\s*(?:\.\.\.)?({_IDENT})")
 _CONTROL_KEYWORD = re.compile(r"(?:\b(?:if|for|while|switch|catch|with)|\bfor\s+await)\s*$")
+_MAX_PARAMS_TEXT = 400
+
+
+def _function_params(content: str, open_idx: int, opens: dict[int, int]) -> list[str] | None:
+    """The parameter names of the function / method / arrow whose body the
+    ``{`` at ``open_idx`` opens, or None when it opens something else (a
+    class, an object literal, an ``if`` / ``for`` block)."""
+    head = content[max(0, open_idx - 200) : open_idx]
+    arrow = _FN_BODY_ARROW.search(head)
+    if arrow:
+        head = head[: arrow.start()]
+        single = _ARROW_PARAM.search(head)
+        if single and not _FN_BODY_AFTER_PARAMS.search(head):
+            return [single.group(1)]
+    params = _FN_BODY_AFTER_PARAMS.search(head)
+    if not params:
+        return [] if arrow else None
+    close = open_idx - (open_idx - max(0, open_idx - 200)) + params.start()
+    paren = opens.get(close)
+    if paren is None:
+        return [] if arrow else None
+    if not arrow and _CONTROL_KEYWORD.search(content, max(0, paren - 20), paren):
+        return None
+    text = content[paren + 1 : min(close, paren + 1 + _MAX_PARAMS_TEXT)]
+    names: list[str] = []
+    depth = 0
+    start = 0
+    # Top-level parameter names only: `(router: Router, { a, b } = {}, ...rest)`.
+    for i, ch in enumerate(text):
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            match = _PARAM_NAME.match(text, start)
+            if match:
+                names.append(match.group(1))
+            start = i
+    match = _PARAM_NAME.match(text, start)
+    if match:
+        names.append(match.group(1))
+    return names
 
 
 def _is_function_body(content: str, open_idx: int, opens: dict[int, int]) -> bool:
-    """True when the ``{`` at ``open_idx`` opens a function / method / arrow
-    body (not a class, object literal or ``if`` / ``for`` block)."""
-    head = content[max(0, open_idx - 200) : open_idx]
-    if _FN_BODY_ARROW.search(head):
-        return True
-    params = _FN_BODY_AFTER_PARAMS.search(head)
-    if not params:
-        return False
-    close = open_idx - len(head) + params.start()
-    paren = opens.get(close)
-    if paren is None:
-        return False
-    return not _CONTROL_KEYWORD.search(content, max(0, paren - 20), paren)
+    return _function_params(content, open_idx, opens) is not None
 
 
 class FileRouters:
@@ -610,9 +643,17 @@ class FileRouters:
         # isn't one, so each method gets its own).
         opens = {c: o for o, c in pairs.items() if content[o] == "("}
         self._top: list[tuple[int, int]] = []
+        # Function bodies by parameter name: a router passed in as a
+        # parameter belongs to its own function, not to a sibling's.
+        self._param_scopes: dict[str, list[tuple[int, int]]] = {}
         for block in blocks:
-            if (not self._top or block[0] > self._top[-1][1]) and _is_function_body(content, block[0], opens):
+            params = _function_params(content, block[0], opens)
+            if params is None:
+                continue
+            if not self._top or block[0] > self._top[-1][1]:
                 self._top.append(block)
+            for param in params[:16]:
+                self._param_scopes.setdefault(param, []).append(block)
         self._top_starts = [s for s, _ in self._top]
         self._blocks = blocks
         self._stack: list[tuple[int, int]] = []
@@ -678,6 +719,21 @@ class FileRouters:
             return self._top[index]
         return (0, self._length)
 
+    def _param_scope(self, name: str, offset: int) -> tuple[int, int] | None:
+        """The innermost function body around ``offset`` that takes ``name``
+        as a parameter."""
+        scopes = self._param_scopes.get(name)
+        if not scopes:
+            return None
+        index = bisect.bisect_right(scopes, (offset, self._length + 1)) - 1
+        for _ in range(_LOOKUP_LIMIT):
+            if index < 0:
+                break
+            if scopes[index][0] <= offset <= scopes[index][1]:
+                return scopes[index]
+            index -= 1
+        return None
+
     def _bind(self, binding: Binding) -> None:
         offsets = self._offsets.setdefault(binding.name, [])
         index = bisect.bisect_right(offsets, binding.offset)
@@ -705,7 +761,7 @@ class FileRouters:
                 return None
         if not create:
             return None
-        scope = self._top_level(offset)
+        scope = self._param_scope(name, offset) or self._top_level(offset)
         free = self._free.get((name, scope[0]))
         if free is None:
             free = self._free[(name, scope[0])] = Binding(name, scope[0], scope)
@@ -1189,10 +1245,15 @@ class Registry:
         self.reexports: dict[str, Reexports] = {}
         self.resolver = resolver or ModuleResolver(None)
         self._export_memo: dict[tuple[str, str], Binding | None] = {}
+        # Every name some file exports (or re-exports by name): `export *`
+        # adds none, so a name outside it is a miss without a walk.
+        self._exported: set[str] = set()
         self._module_memo: dict[tuple[str, str], str | None] = {}
 
     def add(self, routers: FileRouters) -> None:
         self.files[routers.file] = routers
+        self._exported.update(routers.exports)
+        self._exported.update(routers.reexports.named)
 
     def add_module(self, file: str, content: str) -> None:
         """A file without routers that may re-export one (a barrel)."""
@@ -1200,6 +1261,7 @@ class Registry:
             reexports = parse_reexports(content)
             if reexports.named or reexports.star:
                 self.reexports[file] = reexports
+                self._exported.update(reexports.named)
 
     def resolve_module(self, importer: str, spec: str) -> str | None:
         key = (importer, spec)
@@ -1217,17 +1279,25 @@ class Registry:
 
     def lookup_export(self, file: str, name: str) -> Binding | None:
         """The binding ``file`` exports as ``name``, through re-exports.
-        Memoized, and no (module, name) is visited twice in one lookup, so
-        `export *` cycles stay linear."""
+        Every (module, name) result is memoized, so each pair is expanded
+        once per scan; a pair met again while it is still being looked up
+        (an `export *` cycle) is a miss."""
         if name == "*":
             name = "default"
-        return self._lookup(file, name, 0, set())
+        if name not in self._exported:
+            return None
+        return self._lookup(file, name, 0, set(), [_MAX_LOOKUP_STEPS])
 
-    def _lookup(self, file: str, name: str, depth: int, visiting: set[tuple[str, str]]) -> Binding | None:
+    def _lookup(
+        self, file: str, name: str, depth: int, visiting: set[tuple[str, str]], budget: list[int]
+    ) -> Binding | None:
         key = (file, name)
         if key in self._export_memo:
             return self._export_memo[key]
-        if key in visiting or depth >= _MAX_REEXPORT_DEPTH:
+        budget[0] -= 1
+        if key in visiting or depth >= _MAX_REEXPORT_DEPTH or budget[0] < 0:
+            # A cycle (the pair is still being looked up), a chain too deep,
+            # or a lookup that has expanded too many modules.
             return None
         visiting.add(key)
         found: Binding | None = None
@@ -1239,16 +1309,17 @@ class Registry:
             ref = reexports.named.get(name) if reexports is not None else None
             if ref is not None:
                 target = self.resolve_module(file, ref.spec)
-                found = self._lookup(target, ref.name, depth + 1, visiting) if target else None
+                found = self._lookup(target, ref.name, depth + 1, visiting, budget) if target else None
             elif reexports is not None:
                 for spec in reexports.star[:_MAX_STAR_EXPORTS]:
                     target = self.resolve_module(file, spec)
-                    found = self._lookup(target, name, depth + 1, visiting) if target else None
+                    found = self._lookup(target, name, depth + 1, visiting, budget) if target else None
                     if found is not None:
                         break
-        if found is not None or depth == 0:
-            # A miss deep in a cycle may only be a cut-off: cache it from the top.
-            self._export_memo[key] = found
+        visiting.discard(key)
+        # Every result is kept, misses included, so each (file, name) is
+        # expanded once per scan. A miss cut short by a cycle stays a miss.
+        self._export_memo[key] = found
         return found
 
     def finalize(self) -> None:
