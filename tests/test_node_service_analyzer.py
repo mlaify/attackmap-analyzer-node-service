@@ -76,7 +76,8 @@ def test_analyze_extracts_service_signals_and_edges() -> None:
     assert "entrypoint:express_listen" in entrypoints
     assert "edge:api->worker" in edges
     assert "edge:api->feedgen" in edges
-    assert auth_hints == {"bearer_token", "jwt", "signature_sign"}
+    # The fixture only signs a token (jwt.sign), so no `jwt` hint (#13).
+    assert auth_hints == {"bearer_token", "signature_sign"}
     assert "https://worker.internal.local/rebuild" in external_targets
     assert "env://FEEDGEN_URL" in external_targets
     assert "postgresql" in databases
@@ -542,3 +543,36 @@ def test_nestjs_global_guard_and_unknowable_express_cases(tmp_path: Path) -> Non
     # A router passed in from elsewhere: local middleware still counts.
     assert routes["POST /notes"].auth == "required"
     assert routes["POST /drafts"].auth == "unknown"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'import jwt from "jsonwebtoken";\n',
+        "// TODO: check the JWT before trusting it\nconst x = 1;\n",
+        'import jwt from "jsonwebtoken";\nconst t = jwt.sign({ sub: id }, key);\n',
+        'import jwt from "jsonwebtoken";\nconst claims = jwt.decode(token);\n',
+        "const jwtSecret = process.env.SECRET;\n",
+    ],
+)
+def test_jwt_hint_needs_a_verifying_call(tmp_path: Path, body: str) -> None:
+    (tmp_path / "auth.ts").write_text(body, encoding="utf-8")
+    result = NodeServiceAnalyzer().analyze(tmp_path)
+    assert not any(h.hint == "jwt" for h in result.auth_hints)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "const claims = jwt.verify(token, key);",
+        "const { payload } = await jwtVerify(token, jwks);",
+        "await request.jwtVerify();",
+        'app.use(expressjwt({ secret, algorithms: ["HS256"] }));',
+        "passport.use(new JwtStrategy(opts, verifyUser));",
+        "@UseGuards(JwtAuthGuard)",
+    ],
+)
+def test_jwt_hint_from_verification(tmp_path: Path, line: str) -> None:
+    (tmp_path / "auth.ts").write_text("const a = 1;\n" + line + "\n", encoding="utf-8")
+    hints = [h for h in NodeServiceAnalyzer().analyze(tmp_path).auth_hints if h.hint == "jwt"]
+    assert [h.line for h in hints] == [2]

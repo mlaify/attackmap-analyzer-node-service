@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JWT auth hints need verification (#13, AttackMap#325)
+
+- The `jwt` auth hint used to match any word `jwt` or `jsonwebtoken`, which covered imports, `jwt.sign(`, `jwt.decode(` and comments. It now needs a verifying call or middleware: `jwt.verify(`, `jwtVerify(` (jose, `request.jwtVerify()`), `expressjwt(`/`expressJwt(`/`koaJwt(`, passport-jwt `JwtStrategy`, or NestJS `JwtAuthGuard`. Core credits any auth hint near a route as that route's auth.
+- On documenso@503cd1a with `-m node-service`: the hint from a doc comment (`csc/client/oauth.ts:132`) is gone. In `verify-embedding-presign-token.ts` the hint moved from the import line to the `jwtVerify` call. Routes, findings and surface risk are unchanged.
+
 ### Added — cross-file mount paths, chained routers, Fastify / Hono / Elysia mounts (#4)
 
 - **Routes carry their mount prefixes across files.** `app.use('/api/users', requireAuth, usersRouter)` in `app.js` now emits `routes/users.js`'s `router.get('/:id')` as `GET /api/users/:id` (it used to be `GET /:id`), with the mount's middleware as guards. A router mounted at several prefixes gives one route per path (at most 8), each with its own auth. Same-file prefixes work as before; a router no visible code mounts keeps its file-local path.
