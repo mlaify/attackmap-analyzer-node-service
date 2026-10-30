@@ -233,7 +233,17 @@ DB_PATTERNS = [
 AUTH_PATTERNS = [
     (re.compile(r"\bAuthorization\b"), "authorization_header"),
     (re.compile(r"\bBearer\b"), "bearer_token"),
-    (re.compile(r"\bjwt\b|\bjsonwebtoken\b", re.IGNORECASE), "jwt"),
+    # JWT verification only (AttackMap#325): core credits any auth hint near a
+    # route as that route's auth, and an import, `jwt.sign(` / `jwt.decode(` or a
+    # comment authenticates nobody. jsonwebtoken / jose / @fastify/jwt verify
+    # calls, express-jwt / koa-jwt middleware, passport-jwt and NestJS guards.
+    (
+        re.compile(
+            r"\bjwt\.verify\s*\(|\bjwtVerify\s*\(|\b(?:expressjwt|expressJwt|koaJwt|koajwt)\s*\("
+            r"|\bJwtStrategy\b|\bJwtAuthGuard\b"
+        ),
+        "jwt",
+    ),
     # Crypto/JWT verify and sign only: a bare `verify(` / `sign(` matched
     # test helpers, form validators and nearly every JS repo.
     (
