@@ -31,7 +31,7 @@ def test_metadata_contains_required_fields() -> None:
     metadata = NodeServiceAnalyzer().metadata
     assert metadata.name == "node-service"
     assert metadata.display_name == "Node Service Analyzer"
-    assert metadata.version == "0.2.0"
+    assert metadata.version == "0.3.0"
     assert metadata.description
     assert metadata.scope
     assert "node-service" in metadata.targets

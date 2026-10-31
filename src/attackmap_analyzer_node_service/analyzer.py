@@ -282,7 +282,7 @@ class NodeServiceAnalyzer:
     metadata = AnalyzerMetadata(
         name="node-service",
         display_name="Node Service Analyzer",
-        version="0.2.0",
+        version="0.3.0",
         description="Broad Node.js/TypeScript service analyzer covering Express/Fastify/NestJS/Hono/Koa/Elysia/tRPC + NextJS routes, XRPC handlers, workspaces, async workers.",
         scope="Node/TypeScript backend and monorepo repositories with service boundaries, framework handlers, RPC handlers, and inter-service/async messaging.",
         targets=["node-service", "node", "typescript-service"],
