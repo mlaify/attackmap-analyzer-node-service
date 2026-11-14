@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-14
+
 ### Changed — packaging
 - Depends on `attackmap>=0.6.0,<1.0.0` (it was only in the `core` extra), so `pip install attackmap-analyzer-node-service`
   installs a working analyzer on its own. The `core` extra stays for existing installs.
@@ -117,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emits Signal-v2 records (`file:line` citation, evidence text, and confidence
   score) for every signal.
 
-[Unreleased]: https://github.com/mlaify/attackmap-analyzer-node-service/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mlaify/attackmap-analyzer-node-service/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/mlaify/attackmap-analyzer-node-service/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/mlaify/attackmap-analyzer-node-service/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mlaify/attackmap-analyzer-node-service/releases/tag/v0.2.0
 [0.1.0]: https://github.com/mlaify/attackmap-analyzer-node-service/releases/tag/v0.1.0
