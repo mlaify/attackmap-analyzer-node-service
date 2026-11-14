@@ -52,8 +52,8 @@ Middleware counts as a guard by name: authentication (`requireAuth`, `authentica
 ## Install
 
 ```bash
-uv tool install attackmap --with attackmap-analyzer-node-service \
-  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+uv tool install attackmap --with attackmap-analyzer-node-service    # from PyPI
+# or: pip install attackmap-analyzer-node-service    (installs attackmap too)
 # or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-node-service.git
 ```
