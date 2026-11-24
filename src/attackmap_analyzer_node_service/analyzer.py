@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
@@ -282,7 +283,8 @@ class NodeServiceAnalyzer:
     metadata = AnalyzerMetadata(
         name="node-service",
         display_name="Node Service Analyzer",
-        version="0.3.1",
+        version=plugin_version("attackmap-analyzer-node-service", default="0.3.1"),
+        requires_core=">=0.8,<2",
         description="Broad Node.js/TypeScript service analyzer covering Express/Fastify/NestJS/Hono/Koa/Elysia/tRPC + NextJS routes, XRPC handlers, workspaces, async workers.",
         scope="Node/TypeScript backend and monorepo repositories with service boundaries, framework handlers, RPC handlers, and inter-service/async messaging.",
         targets=["node-service", "node", "typescript-service"],
